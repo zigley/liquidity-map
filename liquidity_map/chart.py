@@ -29,7 +29,10 @@ class ChartOptions:
     show_profile: bool = True
     show_heatmap: bool = False
     show_poc_lines: bool = True
+    show_value_area: bool = True
     show_signals: bool = True
+    min_signal_strength: int = 1
+    show_volume: bool = True
     n_bins: int = 80
     price_lines: tuple[PriceLine, ...] = ()
     position: PositionInfo | None = None
@@ -39,22 +42,28 @@ class ChartOptions:
 def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figure:
     profile = build_volume_profile(df, n_bins=options.n_bins)
 
-    profile_width = 0.18 if options.show_profile else 0.0
+    profile_width = 0.2 if options.show_profile else 0.0
     main_width = 1.0 - profile_width
+    n_cols = 2 if options.show_profile else 1
+    n_rows = 2 if options.show_volume else 1
 
     fig = make_subplots(
-        rows=2,
-        cols=2 if options.show_profile else 1,
+        rows=n_rows,
+        cols=n_cols,
         shared_xaxes=True,
         shared_yaxes=True,
         column_widths=[main_width, profile_width] if options.show_profile else [1.0],
-        row_heights=[0.75, 0.25],
+        row_heights=[0.75, 0.25] if options.show_volume else [1.0],
         vertical_spacing=0.06,
-        horizontal_spacing=0.03,
+        horizontal_spacing=0.04,
         specs=[
             [{"type": "xy"}, {"type": "xy"}] if options.show_profile else [{"type": "xy"}],
-            [{"type": "xy"}, {"type": "xy"}] if options.show_profile else [{"type": "xy"}],
-        ],
+        ]
+        + (
+            [[{"type": "xy"}, {"type": "xy"}] if options.show_profile else [{"type": "xy"}]]
+            if options.show_volume
+            else []
+        ),
     )
 
     x_vals = df["datetime"]
@@ -93,9 +102,10 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
     )
 
     if options.show_poc_lines:
-        _add_level(fig, profile.poc_price, "POC", "#fbbf24", "solid")
-        _add_level(fig, profile.vah_price, "VAH", "#93c5fd", "dot")
-        _add_level(fig, profile.val_price, "VAL", "#93c5fd", "dot")
+        _add_level(fig, profile.poc_price, "POC (most traded)", "#f59e0b", "solid", width=2)
+        if options.show_value_area:
+            _add_level(fig, profile.vah_price, "VAH", "#93c5fd", "dot")
+            _add_level(fig, profile.val_price, "VAL", "#93c5fd", "dot")
 
     for line in options.price_lines:
         _add_level(fig, line.price, line.label or f"${line.price:.0f}", line.color, line.dash)
@@ -105,19 +115,20 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
         _add_level(fig, pos.avg_price, f"Entry ${pos.avg_price:.2f}", "#38bdf8", "solid", width=2.5)
 
     if options.show_signals:
-        _add_signal_markers(fig, df, profile)
+        _add_signal_markers(fig, df, profile, min_strength=options.min_signal_strength)
 
-    fig.add_trace(
-        go.Bar(
-            x=x_vals,
-            y=df["volume"],
-            name="Volume",
-            marker_color="rgba(148,163,184,0.5)",
-            showlegend=False,
-        ),
-        row=2,
-        col=1,
-    )
+    if options.show_volume:
+        fig.add_trace(
+            go.Bar(
+                x=x_vals,
+                y=df["volume"],
+                name="Volume",
+                marker_color="rgba(148,163,184,0.5)",
+                showlegend=False,
+            ),
+            row=2,
+            col=1,
+        )
 
     if options.show_profile:
         max_vol = float(profile.volumes.max()) or 1.0
@@ -136,22 +147,23 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
         )
 
     fig.update_layout(
-        title=dict(text=f"{ticker}", font=dict(size=22)),
+        title=dict(text=f"{ticker}", font=dict(size=24)),
         template="plotly_white",
         paper_bgcolor="#f8fafc",
         plot_bgcolor="#ffffff",
-        height=720,
-        margin=dict(l=60, r=100, t=50, b=40),
+        height=680 if options.show_volume else 620,
+        margin=dict(l=64, r=120, t=48, b=36),
         xaxis_rangeslider_visible=False,
-        legend=dict(orientation="h", y=1.08, x=0),
-        font=dict(size=13, color="#1e293b"),
+        legend=dict(orientation="h", y=1.06, x=0, font=dict(size=12)),
+        font=dict(size=14, color="#1e293b"),
         hovermode="x unified",
         bargap=0.15,
     )
 
     fig.update_yaxes(title_text="Price ($)", gridcolor="#e2e8f0", row=1, col=1)
-    fig.update_yaxes(title_text="Volume", gridcolor="#e2e8f0", row=2, col=1)
-    fig.update_xaxes(gridcolor="#e2e8f0", row=2, col=1)
+    if options.show_volume:
+        fig.update_yaxes(title_text="Volume", gridcolor="#e2e8f0", row=2, col=1)
+        fig.update_xaxes(gridcolor="#e2e8f0", row=2, col=1)
     if options.show_profile:
         fig.update_xaxes(showticklabels=False, showgrid=False, row=1, col=2)
         fig.update_yaxes(showticklabels=False, showgrid=False, row=1, col=2)
@@ -182,8 +194,14 @@ def _bar_lookup(df: pd.DataFrame) -> dict:
     return {pd.Timestamp(row.datetime): row for row in df.itertuples(index=False)}
 
 
-def _add_signal_markers(fig: go.Figure, df: pd.DataFrame, profile: VolumeProfile) -> None:
-    signals = detect_liquidity_signals(df, profile)
+def _add_signal_markers(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    profile: VolumeProfile,
+    *,
+    min_strength: int = 1,
+) -> None:
+    signals = [s for s in detect_liquidity_signals(df, profile) if s.strength >= min_strength]
     bars = _bar_lookup(df)
     buys = [s for s in signals if s.side == "buy"]
     sells = [s for s in signals if s.side == "sell"]
@@ -199,7 +217,7 @@ def _add_signal_markers(fig: go.Figure, df: pd.DataFrame, profile: VolumeProfile
                 y=[_y(s, "low") for s in buys],
                 mode="markers",
                 name="Buy",
-                marker=dict(symbol="triangle-up", size=14, color="#16a34a", line=dict(width=1, color="#fff")),
+                marker=dict(symbol="triangle-up", size=16, color="#16a34a", line=dict(width=1.5, color="#fff")),
                 customdata=[s.reason for s in buys],
                 hovertemplate="<b>Buy</b> $%{y:.2f}<br>%{customdata}<extra></extra>",
             ),
@@ -214,7 +232,7 @@ def _add_signal_markers(fig: go.Figure, df: pd.DataFrame, profile: VolumeProfile
                 y=[_y(s, "high") for s in sells],
                 mode="markers",
                 name="Sell",
-                marker=dict(symbol="triangle-down", size=14, color="#dc2626", line=dict(width=1, color="#fff")),
+                marker=dict(symbol="triangle-down", size=16, color="#dc2626", line=dict(width=1.5, color="#fff")),
                 customdata=[s.reason for s in sells],
                 hovertemplate="<b>Sell</b> $%{y:.2f}<br>%{customdata}<extra></extra>",
             ),
