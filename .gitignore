@@ -11,3 +11,4 @@ build/
 .mypy_cache/
 .DS_Store
 .streamlit/secrets.toml
+.trade_state.json
