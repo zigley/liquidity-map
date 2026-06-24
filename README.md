@@ -1,6 +1,6 @@
 # Liquidity Map
 
-Streamlit app that overlays liquidity on stock charts: volume profile, time×price heatmap, POC/value area levels, and buy/sell signals where price aligns with liquid zones.
+Streamlit app that overlays liquidity on stock charts: volume profile, time×price heatmap, POC/value area levels, buy/sell signals, and paper auto-trade.
 
 ## Features
 
@@ -8,8 +8,7 @@ Streamlit app that overlays liquidity on stock charts: volume profile, time×pri
 - Liquidity heatmap behind candlesticks
 - POC, VAH, VAL levels
 - Buy/sell signals at HVN support, VAH/POC resistance, POC reclaim/loss, LVN→HVN moves
-- Optional Robinhood bid/ask spread (live liquidity read)
-- Auto-trade liquidity signals via Robinhood (dry-run by default)
+- Paper auto-trade from liquidity signals (no broker login)
 
 ## Quick start
 
@@ -18,50 +17,27 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Or:
-
-```bash
-pip install -e .
-python -m streamlit run app.py
-```
-
 Open http://localhost:8501
 
-## Optional Robinhood spread
+## Paper auto-trade
 
-Copy `.env.example` to `.env` and set credentials, or enter them in the sidebar.
-
-```
-RH_USERNAME=your_email@example.com
-RH_PASSWORD=your_password
-```
-
-## Auto-trade
-
-Trades the **latest confirmed-bar** liquidity signal (buy at support, sell at resistance).
-
-**Dry-run is ON by default** — no real orders until you disable it.
+Trades the **latest confirmed-bar** liquidity signal using a simulated portfolio ($10k starting cash by default).
 
 ### In the Streamlit app
 
-1. Log in to Robinhood in the sidebar
-2. Enable **Auto-trade**
-3. Use **Run trade check now** or enable **Auto-poll**
+1. Enable **Paper auto-trade** in the sidebar
+2. Click **Run trade check now** or enable **Auto-poll**
 
-### Background daemon (recommended for 24/7)
+### Background daemon
 
 ```bash
-# Dry-run (safe default)
 python auto_trade.py --ticker SPY --poll-seconds 60
-
-# LIVE orders (real money)
-python auto_trade.py --ticker SPY --live
 ```
 
-Configure via `.env`:
+Optional `.env` settings:
 
 ```
-AUTO_TRADE_DRY_RUN=true
+PAPER_STARTING_CASH=10000
 AUTO_TRADE_AMOUNT_USD=100
 AUTO_TRADE_MIN_STRENGTH=2
 AUTO_TRADE_MAX_DAILY=5
@@ -72,19 +48,18 @@ AUTO_TRADE_MAX_DAILY=5
 1. Push this repo to GitHub
 2. Go to [share.streamlit.io](https://share.streamlit.io)
 3. New app → select repo → main file: `app.py`
-4. Add secrets for Robinhood (optional): `RH_USERNAME`, `RH_PASSWORD`
 
 ## Project structure
 
 ```
 app.py                  # Streamlit UI
 liquidity_map/
-  data.py               # yfinance + Robinhood quotes
+  data.py               # yfinance data
   profile.py            # Volume profile engine
   heatmap.py            # Liquidity heatmap
   signals.py            # Buy/sell signal detection
   chart.py              # Plotly chart builder
-  liquidity_score.py    # Spread scoring
+  paper_broker.py       # Simulated portfolio
   auto_trader.py        # Signal execution + risk limits
-auto_trade.py           # Background auto-trade daemon
+auto_trade.py           # Background paper-trade daemon
 ```

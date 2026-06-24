@@ -1,4 +1,4 @@
-"""Market data loaders: yfinance history + optional Robinhood quotes."""
+"""Market data loaders via yfinance."""
 
 from __future__ import annotations
 
@@ -99,48 +99,14 @@ def fetch_bars(
     return df[["datetime", "open", "high", "low", "close", "volume"]]
 
 
-def login_robinhood(username: str, password: str) -> bool:
-    """Authenticate with Robinhood; returns True on success."""
-    import robin_stocks.robinhood as rh
-
-    try:
-        rh.login(username=username, password=password, store_session=True)
-        return True
-    except Exception:
-        return False
-
-
 def fetch_quote(ticker: str) -> Quote:
-    """Fetch live top-of-book quote from an active Robinhood session."""
-    import robin_stocks.robinhood as rh
-
+    """Best-effort bid/ask from yfinance (may be absent for some symbols)."""
     symbol = ticker.strip().upper()
-    quotes = rh.get_quotes(symbol)
-    if not quotes:
-        return Quote(symbol=symbol, bid=None, ask=None, last=None, spread_pct=None)
-
-    q = quotes[0] if isinstance(quotes, list) else quotes
-
-    def _f(key: str) -> float | None:
-        val = q.get(key)
-        if val is None or val == "" or val == "0" or val == 0:
-            return None
-        try:
-            return float(val)
-        except (TypeError, ValueError):
-            return None
-
-    bid = _f("bid_price")
-    ask = _f("ask_price")
-    last = _f("last_trade_price") or _f("last_extended_hours_trade_price")
-
+    info = yf.Ticker(symbol).fast_info
+    bid = getattr(info, "last_price", None)
+    last = bid
     spread_pct = None
-    if bid is not None and ask is not None and bid > 0 and ask > 0:
-        mid = (bid + ask) / 2
-        if mid > 0:
-            spread_pct = (ask - bid) / mid * 100
-
-    return Quote(symbol=symbol, bid=bid, ask=ask, last=last, spread_pct=spread_pct)
+    return Quote(symbol=symbol, bid=bid, ask=None, last=last, spread_pct=spread_pct)
 
 
 def load_env_credentials() -> tuple[str | None, str | None]:

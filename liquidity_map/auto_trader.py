@@ -1,4 +1,4 @@
-"""Auto-trade liquidity signals via Robinhood."""
+"""Auto-trade liquidity signals via paper trading (yfinance only)."""
 
 from __future__ import annotations
 
@@ -12,8 +12,14 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from liquidity_map.data import Quote, fetch_quote
-from liquidity_map.liquidity_score import quote_rating
+from liquidity_map.paper_broker import (
+    PaperPortfolio,
+    get_position_qty,
+    last_price,
+    paper_buy,
+    paper_sell,
+    portfolio_value,
+)
 from liquidity_map.profile import VolumeProfile, build_volume_profile
 from liquidity_map.signals import LiquiditySignal, detect_liquidity_signals
 
@@ -29,9 +35,10 @@ class TradeConfig:
     trade_amount_usd: float = 100.0
     min_strength: int = 2
     max_daily_trades: int = 5
-    require_liquid_spread: bool = True
+    require_liquid_spread: bool = False
     sell_full_position: bool = True
     use_confirmed_bar: bool = True
+    paper_starting_cash: float = 10_000.0
 
 
 @dataclass
@@ -51,6 +58,8 @@ class TradeState:
     daily_trade_count: int = 0
     daily_trade_date: str = ""
     trade_log: list[dict] = field(default_factory=list)
+    paper_cash: float = 10_000.0
+    paper_positions: dict[str, float] = field(default_factory=dict)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -69,7 +78,8 @@ def load_trade_config() -> TradeConfig:
         trade_amount_usd=float(os.getenv("AUTO_TRADE_AMOUNT_USD", "100")),
         min_strength=int(os.getenv("AUTO_TRADE_MIN_STRENGTH", "2")),
         max_daily_trades=int(os.getenv("AUTO_TRADE_MAX_DAILY", "5")),
-        require_liquid_spread=_env_bool("AUTO_TRADE_REQUIRE_LIQUID_SPREAD", True),
+        require_liquid_spread=_env_bool("AUTO_TRADE_REQUIRE_LIQUID_SPREAD", False),
+        paper_starting_cash=float(os.getenv("PAPER_STARTING_CASH", "10000")),
     )
 
 
@@ -79,7 +89,8 @@ def signal_key(symbol: str, signal: LiquiditySignal) -> str:
 
 def load_trade_state(path: Path = STATE_FILE) -> TradeState:
     if not path.exists():
-        return TradeState()
+        cfg = load_trade_config()
+        return TradeState(paper_cash=cfg.paper_starting_cash)
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         return TradeState(
@@ -87,6 +98,8 @@ def load_trade_state(path: Path = STATE_FILE) -> TradeState:
             daily_trade_count=int(raw.get("daily_trade_count", 0)),
             daily_trade_date=str(raw.get("daily_trade_date", "")),
             trade_log=list(raw.get("trade_log", [])),
+            paper_cash=float(raw.get("paper_cash", 10_000)),
+            paper_positions=dict(raw.get("paper_positions", {})),
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return TradeState()
@@ -94,6 +107,10 @@ def load_trade_state(path: Path = STATE_FILE) -> TradeState:
 
 def save_trade_state(state: TradeState, path: Path = STATE_FILE) -> None:
     path.write_text(json.dumps(asdict(state), indent=2, default=str), encoding="utf-8")
+
+
+def get_paper_portfolio(state: TradeState) -> PaperPortfolio:
+    return PaperPortfolio(cash=state.paper_cash, positions=dict(state.paper_positions))
 
 
 def _reset_daily_counter(state: TradeState) -> None:
@@ -109,7 +126,6 @@ def get_actionable_signal(
     min_strength: int = 2,
     use_confirmed_bar: bool = True,
 ) -> LiquiditySignal | None:
-    """Return the signal on the latest confirmed bar, if any."""
     if len(df) < 2:
         return None
 
@@ -134,102 +150,56 @@ def _market_open() -> bool:
     return open_time <= now <= close_time
 
 
-def _get_position_qty(symbol: str) -> float:
-    import robin_stocks.robinhood as rh
-
-    holdings = rh.account.build_holdings() or {}
-    pos = holdings.get(symbol.upper())
-    if not pos:
-        return 0.0
-    return float(pos.get("quantity", 0) or 0)
-
-
-def _place_buy(symbol: str, amount_usd: float, dry_run: bool) -> tuple[str | None, str]:
-    if dry_run:
-        return f"dry-buy-{int(datetime.now().timestamp())}", f"DRY RUN buy ${amount_usd:.2f} of {symbol}"
-
-    import robin_stocks.robinhood as rh
-
-    resp = rh.orders.order_buy_fractional_by_price(symbol, amount_usd)
-    if not resp:
-        raise RuntimeError("Buy order returned empty response")
-    order_id = resp.get("id") or resp.get("order_id") or str(resp)
-    return str(order_id), f"Bought ${amount_usd:.2f} of {symbol}"
-
-
-def _place_sell(symbol: str, qty: float, dry_run: bool) -> tuple[str | None, str]:
-    if qty <= 0:
-        raise RuntimeError(f"No {symbol} shares to sell")
-
-    if dry_run:
-        return f"dry-sell-{int(datetime.now().timestamp())}", f"DRY RUN sell {qty:.4f} shares of {symbol}"
-
-    import robin_stocks.robinhood as rh
-
-    resp = rh.orders.order_sell_market(symbol, qty)
-    if not resp:
-        raise RuntimeError("Sell order returned empty response")
-    order_id = resp.get("id") or resp.get("order_id") or str(resp)
-    return str(order_id), f"Sold {qty:.4f} shares of {symbol}"
-
-
 def evaluate_and_trade(
     symbol: str,
     df: pd.DataFrame,
     config: TradeConfig | None = None,
     state: TradeState | None = None,
-    quote: Quote | None = None,
     state_path: Path = STATE_FILE,
 ) -> TradeResult:
-    """Evaluate the latest liquidity signal and optionally place a Robinhood order."""
+    """Evaluate the latest liquidity signal and paper-trade at the last close."""
     cfg = config or load_trade_config()
     st = state if state is not None else load_trade_state(state_path)
     sym = symbol.strip().upper()
+    price = last_price(df)
 
     _reset_daily_counter(st)
 
     if not _market_open():
-        return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=cfg.dry_run)
+        return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=True)
 
     profile = build_volume_profile(df)
     signal = get_actionable_signal(df, profile, cfg.min_strength, cfg.use_confirmed_bar)
     if signal is None:
-        return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=cfg.dry_run)
+        return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=True)
 
     key = signal_key(sym, signal)
     if key in st.executed_keys:
-        return TradeResult(action="skip", symbol=sym, signal=signal, message="Signal already traded", dry_run=cfg.dry_run)
+        return TradeResult(action="skip", symbol=sym, signal=signal, message="Signal already traded", dry_run=True)
 
     if st.daily_trade_count >= cfg.max_daily_trades:
-        return TradeResult(action="skip", symbol=sym, signal=signal, message="Daily trade limit reached", dry_run=cfg.dry_run)
+        return TradeResult(action="skip", symbol=sym, signal=signal, message="Daily trade limit reached", dry_run=True)
 
-    if cfg.require_liquid_spread:
-        q = quote or fetch_quote(sym)
-        rating = quote_rating(q)
-        if rating.label == "Illiquid":
-            return TradeResult(
-                action="skip",
-                symbol=sym,
-                signal=signal,
-                message=f"Spread too wide ({rating.spread_pct or 0:.3f}%)",
-                dry_run=cfg.dry_run,
-            )
+    portfolio = get_paper_portfolio(st)
 
     try:
         if signal.side == "buy":
-            order_id, msg = _place_buy(sym, cfg.trade_amount_usd, cfg.dry_run)
+            order_id, msg, portfolio = paper_buy(portfolio, sym, cfg.trade_amount_usd, price)
             action: Action = "buy"
         else:
-            qty = _get_position_qty(sym)
+            qty = get_position_qty(portfolio, sym)
             if qty <= 0:
-                return TradeResult(action="skip", symbol=sym, signal=signal, message="Sell signal but no position", dry_run=cfg.dry_run)
-            order_id, msg = _place_sell(sym, qty, cfg.dry_run)
+                return TradeResult(action="skip", symbol=sym, signal=signal, message="Sell signal but no paper position", dry_run=True)
+            order_id, msg, portfolio = paper_sell(portfolio, sym, price)
             action = "sell"
     except Exception as exc:
-        return TradeResult(action="skip", symbol=sym, signal=signal, message=f"Order failed: {exc}", dry_run=cfg.dry_run)
+        return TradeResult(action="skip", symbol=sym, signal=signal, message=f"Order failed: {exc}", dry_run=True)
 
+    st.paper_cash = portfolio.cash
+    st.paper_positions = portfolio.positions
     st.executed_keys.append(key)
     st.daily_trade_count += 1
+    equity = portfolio_value(portfolio, {sym: price})
     log_entry = {
         "timestamp": datetime.now(ET).isoformat(),
         "symbol": sym,
@@ -237,11 +207,12 @@ def evaluate_and_trade(
         "signal_reason": signal.reason,
         "signal_strength": signal.strength,
         "order_id": order_id,
-        "dry_run": cfg.dry_run,
+        "price": price,
+        "paper_equity": round(equity, 2),
         "message": msg,
     }
     st.trade_log.append(log_entry)
     st.trade_log = st.trade_log[-100:]
     save_trade_state(st, state_path)
 
-    return TradeResult(action=action, symbol=sym, signal=signal, message=msg, order_id=order_id, dry_run=cfg.dry_run)
+    return TradeResult(action=action, symbol=sym, signal=signal, message=f"{msg} | equity ${equity:,.2f}", order_id=order_id, dry_run=True)
