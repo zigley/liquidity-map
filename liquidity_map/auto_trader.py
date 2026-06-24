@@ -15,6 +15,8 @@ import pandas as pd
 from liquidity_map.paper_broker import (
     PaperPortfolio,
     get_position_qty,
+    infer_cost_basis_from_log,
+    last_buy_price_from_log,
     last_price,
     paper_buy,
     paper_sell,
@@ -60,6 +62,7 @@ class TradeState:
     trade_log: list[dict] = field(default_factory=list)
     paper_cash: float = 10_000.0
     paper_positions: dict[str, float] = field(default_factory=dict)
+    paper_cost_basis: dict[str, float] = field(default_factory=dict)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -74,7 +77,7 @@ def load_trade_config() -> TradeConfig:
 
     load_dotenv()
     return TradeConfig(
-        dry_run=_env_bool("AUTO_TRADE_DRY_RUN", True),
+        dry_run=_env_bool("AUTO_TRADE_DRY_RUN", False),
         trade_amount_usd=float(os.getenv("AUTO_TRADE_AMOUNT_USD", "100")),
         min_strength=int(os.getenv("AUTO_TRADE_MIN_STRENGTH", "2")),
         max_daily_trades=int(os.getenv("AUTO_TRADE_MAX_DAILY", "5")),
@@ -100,6 +103,7 @@ def load_trade_state(path: Path = STATE_FILE) -> TradeState:
             trade_log=list(raw.get("trade_log", [])),
             paper_cash=float(raw.get("paper_cash", 10_000)),
             paper_positions=dict(raw.get("paper_positions", {})),
+            paper_cost_basis=dict(raw.get("paper_cost_basis", {})),
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return TradeState()
@@ -109,8 +113,33 @@ def save_trade_state(state: TradeState, path: Path = STATE_FILE) -> None:
     path.write_text(json.dumps(asdict(state), indent=2, default=str), encoding="utf-8")
 
 
-def get_paper_portfolio(state: TradeState) -> PaperPortfolio:
-    return PaperPortfolio(cash=state.paper_cash, positions=dict(state.paper_positions))
+def get_paper_portfolio(state: TradeState, symbol: str | None = None) -> PaperPortfolio:
+    portfolio = PaperPortfolio(
+        cash=state.paper_cash,
+        positions=dict(state.paper_positions),
+        cost_basis=dict(state.paper_cost_basis),
+    )
+    if not symbol:
+        return portfolio
+
+    sym = symbol.upper()
+    state_qty = float(portfolio.positions.get(sym, 0.0))
+    has_basis = float(portfolio.cost_basis.get(sym, 0.0)) > 0
+
+    if not has_basis:
+        log_qty, log_avg = infer_cost_basis_from_log(state.trade_log, sym)
+        if state_qty > 0:
+            if log_avg > 0:
+                portfolio.cost_basis[sym] = log_avg
+            else:
+                fallback = last_buy_price_from_log(state.trade_log, sym)
+                if fallback > 0:
+                    portfolio.cost_basis[sym] = fallback
+        elif log_qty > 0 and log_avg > 0:
+            portfolio.positions[sym] = log_qty
+            portfolio.cost_basis[sym] = log_avg
+
+    return portfolio
 
 
 def _reset_daily_counter(state: TradeState) -> None:
@@ -166,37 +195,51 @@ def evaluate_and_trade(
     _reset_daily_counter(st)
 
     if not _market_open():
-        return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=True)
+        return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=cfg.dry_run)
 
     profile = build_volume_profile(df)
     signal = get_actionable_signal(df, profile, cfg.min_strength, cfg.use_confirmed_bar)
     if signal is None:
-        return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=True)
+        return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=cfg.dry_run)
 
     key = signal_key(sym, signal)
     if key in st.executed_keys:
-        return TradeResult(action="skip", symbol=sym, signal=signal, message="Signal already traded", dry_run=True)
+        return TradeResult(action="skip", symbol=sym, signal=signal, message="Signal already traded", dry_run=cfg.dry_run)
 
     if st.daily_trade_count >= cfg.max_daily_trades:
-        return TradeResult(action="skip", symbol=sym, signal=signal, message="Daily trade limit reached", dry_run=True)
+        return TradeResult(action="skip", symbol=sym, signal=signal, message="Daily trade limit reached", dry_run=cfg.dry_run)
+
+    if cfg.dry_run:
+        side = signal.side.upper()
+        amt = f"${cfg.trade_amount_usd:.2f}" if signal.side == "buy" else "full position"
+        return TradeResult(
+            action="skip",
+            symbol=sym,
+            signal=signal,
+            message=f"Signal only: would {side} {sym} ({amt}) @ ${price:.2f} — {signal.reason}",
+            dry_run=True,
+        )
 
     portfolio = get_paper_portfolio(st)
+    sell_proceeds = 0.0
 
     try:
         if signal.side == "buy":
             order_id, msg, portfolio = paper_buy(portfolio, sym, cfg.trade_amount_usd, price)
             action: Action = "buy"
         else:
-            qty = get_position_qty(portfolio, sym)
-            if qty <= 0:
+            sell_qty = get_position_qty(portfolio, sym)
+            if sell_qty <= 0:
                 return TradeResult(action="skip", symbol=sym, signal=signal, message="Sell signal but no paper position", dry_run=True)
             order_id, msg, portfolio = paper_sell(portfolio, sym, price)
             action = "sell"
+            sell_proceeds = sell_qty * price
     except Exception as exc:
         return TradeResult(action="skip", symbol=sym, signal=signal, message=f"Order failed: {exc}", dry_run=True)
 
     st.paper_cash = portfolio.cash
     st.paper_positions = portfolio.positions
+    st.paper_cost_basis = portfolio.cost_basis
     st.executed_keys.append(key)
     st.daily_trade_count += 1
     equity = portfolio_value(portfolio, {sym: price})
@@ -208,6 +251,7 @@ def evaluate_and_trade(
         "signal_strength": signal.strength,
         "order_id": order_id,
         "price": price,
+        "amount_usd": cfg.trade_amount_usd if action == "buy" else round(sell_proceeds, 2) if action == "sell" else 0,
         "paper_equity": round(equity, 2),
         "message": msg,
     }
@@ -215,4 +259,4 @@ def evaluate_and_trade(
     st.trade_log = st.trade_log[-100:]
     save_trade_state(st, state_path)
 
-    return TradeResult(action=action, symbol=sym, signal=signal, message=f"{msg} | equity ${equity:,.2f}", order_id=order_id, dry_run=True)
+    return TradeResult(action=action, symbol=sym, signal=signal, message=f"{msg} | equity ${equity:,.2f}", order_id=order_id, dry_run=False)

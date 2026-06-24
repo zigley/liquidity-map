@@ -10,10 +10,19 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 from liquidity_map.data import Quote
+from liquidity_map.paper_broker import PositionInfo
 from liquidity_map.heatmap import build_liquidity_heatmap
 from liquidity_map.liquidity_score import SpreadRating, quote_rating
 from liquidity_map.profile import VolumeProfile, build_volume_profile
 from liquidity_map.signals import LiquiditySignal, detect_liquidity_signals
+
+
+@dataclass(frozen=True)
+class PriceLine:
+    price: float
+    label: str = ""
+    color: str = "#e879f9"
+    dash: str = "dash"
 
 
 @dataclass(frozen=True)
@@ -23,8 +32,14 @@ class ChartOptions:
     show_poc_lines: bool = True
     show_hvn_lvn: bool = False
     show_signals: bool = True
+    show_signal_price_lines: bool = True
+    show_paper_trades: bool = True
     n_bins: int = 100
     quote: Quote | None = None
+    paper_trades: list[dict] | None = None
+    price_lines: tuple[PriceLine, ...] = ()
+    position: PositionInfo | None = None
+    show_position_line: bool = True
 
 
 def _max_profile_volume(volumes: np.ndarray) -> float:
@@ -121,20 +136,41 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
             col=1,
         )
 
+    for line in options.price_lines:
+        _add_price_line(fig, line)
+
+    if options.show_position_line and options.position:
+        _add_position_line(fig, options.position)
+
+    signal_bars: dict = {}
     if options.show_signals:
-        _add_signal_markers(fig, df, profile)
+        signal_bars = _add_signal_markers(fig, df, profile, options.show_signal_price_lines)
+
+    volume_colors = []
+    for ts in x_vals:
+        key = pd.Timestamp(ts)
+        side = signal_bars.get(key)
+        if side == "buy":
+            volume_colors.append("#22c55e")
+        elif side == "sell":
+            volume_colors.append("#ef4444")
+        else:
+            volume_colors.append("rgba(100,116,139,0.55)")
 
     fig.add_trace(
         go.Bar(
             x=x_vals,
             y=df["volume"],
             name="Volume",
-            marker_color="rgba(100,116,139,0.55)",
+            marker_color=volume_colors,
             showlegend=False,
         ),
         row=2,
         col=1,
     )
+
+    if options.show_paper_trades and options.paper_trades:
+        _add_paper_trade_markers(fig, df, options.paper_trades)
 
     if options.show_profile:
         max_vol = _max_profile_volume(profile.volumes)
@@ -201,50 +237,229 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
     return fig
 
 
-def _add_signal_markers(fig: go.Figure, df: pd.DataFrame, profile: VolumeProfile) -> None:
+def _bar_lookup(df: pd.DataFrame) -> dict:
+    return {pd.Timestamp(row.datetime): row for row in df.itertuples(index=False)}
+
+
+def _signal_y(signal: LiquiditySignal, bars: dict, side: str) -> float:
+    bar = bars.get(pd.Timestamp(signal.datetime))
+    if bar is None:
+        return signal.price
+    return float(bar.low) if side == "buy" else float(bar.high)
+
+
+def _add_position_line(fig: go.Figure, pos: PositionInfo) -> None:
+    pnl_sign = "+" if pos.pnl >= 0 else ""
+    pnl_color = "#22c55e" if pos.pnl >= 0 else "#ef4444"
+    label = (
+        f"Position {pos.qty:.2f} {pos.symbol} @ ${pos.avg_price:.2f} "
+        f"({pnl_sign}${pos.pnl:.2f} / {pnl_sign}{pos.pnl_pct:.1f}%)"
+    )
+    fig.add_hline(
+        y=pos.avg_price,
+        line=dict(color="#38bdf8", width=2.5, dash="solid"),
+        annotation_text=label,
+        annotation_position="right",
+        annotation_font=dict(color="#38bdf8", size=12),
+        row=1,
+        col=1,
+    )
+    fig.add_hline(
+        y=pos.market_price,
+        line=dict(color=pnl_color, width=1.5, dash="dashdot"),
+        annotation_text=f"Mark ${pos.market_price:.2f}",
+        annotation_position="left",
+        annotation_font=dict(color=pnl_color, size=11),
+        row=1,
+        col=1,
+    )
+    fig.add_shape(
+        type="rect",
+        x0=0,
+        x1=1,
+        xref="paper",
+        y0=min(pos.avg_price, pos.market_price),
+        y1=max(pos.avg_price, pos.market_price),
+        fillcolor="rgba(56,189,248,0.12)" if pos.pnl >= 0 else "rgba(239,68,68,0.12)",
+        line=dict(width=0),
+        layer="below",
+        row=1,
+        col=1,
+    )
+
+
+def _add_price_line(fig: go.Figure, line: PriceLine) -> None:
+    label = line.label or f"${line.price:.2f}"
+    fig.add_hline(
+        y=line.price,
+        line=dict(color=line.color, width=2, dash=line.dash),
+        annotation_text=label,
+        annotation_position="right",
+        annotation_font=dict(color=line.color, size=12),
+        row=1,
+        col=1,
+    )
+
+
+def _add_signal_markers(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    profile: VolumeProfile,
+    draw_price_lines: bool = True,
+) -> dict:
+    """Draw buy/sell markers on the chart. Returns {datetime: side} for volume coloring."""
     signals = detect_liquidity_signals(df, profile)
+    bars = _bar_lookup(df)
     buys = [s for s in signals if s.side == "buy"]
     sells = [s for s in signals if s.side == "sell"]
+    signal_bars: dict = {}
+
+    for s in signals:
+        signal_bars[pd.Timestamp(s.datetime)] = s.side
 
     if buys:
+        buy_x = [s.datetime for s in buys]
+        buy_y = [_signal_y(s, bars, "buy") for s in buys]
+        buy_text = ["BUY"] * len(buys)
         fig.add_trace(
             go.Scatter(
-                x=[s.datetime for s in buys],
-                y=[s.price for s in buys],
-                mode="markers",
-                name="Buy",
+                x=buy_x,
+                y=buy_y,
+                mode="markers+text",
+                name="Buy signals",
+                text=buy_text,
+                textposition="bottom center",
+                textfont=dict(size=11, color="#4ade80", family="Arial Black"),
                 marker=dict(
                     symbol="triangle-up",
-                    size=[8 + s.strength * 2 for s in buys],
+                    size=[14 + s.strength * 4 for s in buys],
                     color="#22c55e",
-                    line=dict(width=1, color="#14532d"),
+                    line=dict(width=2, color="#ffffff"),
                 ),
                 customdata=[s.reason for s in buys],
-                hovertemplate="BUY<br>%{x}<br>%{y:.2f}<br>%{customdata}<extra></extra>",
+                hovertemplate="<b>BUY</b><br>%{x}<br>$%{y:.2f}<br>%{customdata}<extra></extra>",
             ),
             row=1,
             col=1,
         )
+        for x in buy_x:
+            fig.add_vline(x=x, line=dict(color="rgba(34,197,94,0.35)", width=1, dash="dot"), row=1, col=1)
+        if draw_price_lines:
+            for price in sorted({round(y, 2) for y in buy_y}):
+                fig.add_hline(
+                    y=price,
+                    line=dict(color="rgba(34,197,94,0.45)", width=1.5, dash="dot"),
+                    annotation_text=f"Buy ${price:.2f}",
+                    annotation_position="left",
+                    annotation_font=dict(color="#4ade80", size=10),
+                    row=1,
+                    col=1,
+                )
 
     if sells:
+        sell_x = [s.datetime for s in sells]
+        sell_y = [_signal_y(s, bars, "sell") for s in sells]
+        sell_text = ["SELL"] * len(sells)
         fig.add_trace(
             go.Scatter(
-                x=[s.datetime for s in sells],
-                y=[s.price for s in sells],
-                mode="markers",
-                name="Sell",
+                x=sell_x,
+                y=sell_y,
+                mode="markers+text",
+                name="Sell signals",
+                text=sell_text,
+                textposition="top center",
+                textfont=dict(size=11, color="#f87171", family="Arial Black"),
                 marker=dict(
                     symbol="triangle-down",
-                    size=[8 + s.strength * 2 for s in sells],
+                    size=[14 + s.strength * 4 for s in sells],
                     color="#ef4444",
-                    line=dict(width=1, color="#7f1d1d"),
+                    line=dict(width=2, color="#ffffff"),
                 ),
                 customdata=[s.reason for s in sells],
-                hovertemplate="SELL<br>%{x}<br>%{y:.2f}<br>%{customdata}<extra></extra>",
+                hovertemplate="<b>SELL</b><br>%{x}<br>$%{y:.2f}<br>%{customdata}<extra></extra>",
             ),
             row=1,
             col=1,
         )
+        for x in sell_x:
+            fig.add_vline(x=x, line=dict(color="rgba(239,68,68,0.35)", width=1, dash="dot"), row=1, col=1)
+        if draw_price_lines:
+            for price in sorted({round(y, 2) for y in sell_y}, reverse=True):
+                fig.add_hline(
+                    y=price,
+                    line=dict(color="rgba(239,68,68,0.45)", width=1.5, dash="dot"),
+                    annotation_text=f"Sell ${price:.2f}",
+                    annotation_position="left",
+                    annotation_font=dict(color="#f87171", size=10),
+                    row=1,
+                    col=1,
+                )
+
+    return signal_bars
+
+
+def _add_paper_trade_markers(fig: go.Figure, df: pd.DataFrame, trades: list[dict]) -> None:
+    """Overlay executed paper trades as diamond markers."""
+    bars = _bar_lookup(df)
+    executed_buys = [t for t in trades if t.get("action") == "buy"]
+    executed_sells = [t for t in trades if t.get("action") == "sell"]
+
+    def _match_x(trade: dict):
+        ts = pd.Timestamp(trade.get("timestamp", ""))
+        for bar_ts, bar in bars.items():
+            if abs((bar_ts - ts).total_seconds()) < 86400:
+                return bar_ts, float(trade.get("price", bar.close))
+        return None, float(trade.get("price", 0))
+
+    if executed_buys:
+        xs, ys, labels = [], [], []
+        for t in executed_buys:
+            x, y = _match_x(t)
+            if x is not None:
+                xs.append(x)
+                ys.append(y)
+                labels.append("FILLED BUY")
+        if xs:
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="markers+text",
+                    name="Paper buys",
+                    text=labels,
+                    textposition="middle right",
+                    textfont=dict(size=10, color="#86efac"),
+                    marker=dict(symbol="diamond", size=12, color="#16a34a", line=dict(width=2, color="#fff")),
+                    hovertemplate="<b>Paper BUY</b><br>%{x}<br>$%{y:.2f}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
+
+    if executed_sells:
+        xs, ys, labels = [], [], []
+        for t in executed_sells:
+            x, y = _match_x(t)
+            if x is not None:
+                xs.append(x)
+                ys.append(y)
+                labels.append("FILLED SELL")
+        if xs:
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="markers+text",
+                    name="Paper sells",
+                    text=labels,
+                    textposition="middle left",
+                    textfont=dict(size=10, color="#fca5a5"),
+                    marker=dict(symbol="diamond", size=12, color="#dc2626", line=dict(width=2, color="#fff")),
+                    hovertemplate="<b>Paper SELL</b><br>%{x}<br>$%{y:.2f}<extra></extra>",
+                ),
+                row=1,
+                col=1,
+            )
 
 
 def _add_zone_rects(
