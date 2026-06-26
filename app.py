@@ -37,7 +37,7 @@ INTERVAL_OPTIONS = {
 
 @st.cache_data(show_spinner=False)
 def cached_backtest(
-    df_key: str,
+    df: pd.DataFrame,
     rolling_window: int,
     min_strength: int,
     use_rolling_profile: bool,
@@ -45,8 +45,6 @@ def cached_backtest(
     h10: bool,
     h20: bool,
 ) -> BacktestResult:
-    df = pd.read_json(df_key)
-    df["datetime"] = pd.to_datetime(df["datetime"])
     horizons: list[int] = []
     if h5:
         horizons.append(5)
@@ -57,16 +55,12 @@ def cached_backtest(
     if not horizons:
         horizons = [10]
     return run_backtest(
-        df,
+        df.copy(),
         rolling_window=rolling_window,
         min_strength=min_strength,
         horizons=tuple(horizons),
         use_rolling_profile=use_rolling_profile,
     )
-
-
-def _df_cache_key(df: pd.DataFrame) -> str:
-    return df.to_json(date_format="iso")
 
 
 def render_chart_tab(
@@ -169,7 +163,7 @@ def render_backtest_tab(df: pd.DataFrame, ticker: str) -> None:
 
     with st.spinner("Running backtest…"):
         result = cached_backtest(
-            _df_cache_key(df),
+            df,
             rolling_window,
             bt_min_strength,
             use_rolling,
