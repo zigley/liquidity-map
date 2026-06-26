@@ -7,7 +7,14 @@ from dataclasses import dataclass, field
 import pandas as pd
 
 from liquidity_map.profile import build_volume_profile
-from liquidity_map.signals import LiquiditySignal, detect_liquidity_signals
+from liquidity_map.signals import (
+    DEFAULT_SIGNAL_CONFIG,
+    LEGACY_SIGNAL_CONFIG,
+    STRICT_SIGNAL_CONFIG,
+    LiquiditySignal,
+    SignalConfig,
+    detect_liquidity_signals,
+)
 
 
 @dataclass(frozen=True)
@@ -15,10 +22,14 @@ class SignalOutcome:
     datetime: object
     side: str
     reason: str
-    strength: int
+    confluence: int
     entry_price: float
     returns: dict[int, float] = field(default_factory=dict)
     wins: dict[int, bool] = field(default_factory=dict)
+
+    @property
+    def strength(self) -> int:
+        return self.confluence
 
 
 @dataclass(frozen=True)
@@ -36,20 +47,24 @@ class BacktestResult:
     horizons: tuple[int, ...]
     rolling_window: int
     use_rolling_profile: bool
-    min_strength: int
+    signal_config: SignalConfig
     overall: tuple[HorizonStats, ...]
     buy: tuple[HorizonStats, ...]
     sell: tuple[HorizonStats, ...]
 
+    @property
+    def min_strength(self) -> int:
+        return self.signal_config.min_confluence
 
-def _signal_at_bar(window: pd.DataFrame, min_strength: int) -> LiquiditySignal | None:
+
+def _signal_at_bar(window: pd.DataFrame, config: SignalConfig) -> LiquiditySignal | None:
     profile = build_volume_profile(window)
-    signals = detect_liquidity_signals(window, profile)
+    signals = detect_liquidity_signals(window, profile, config=config)
     if not signals:
         return None
     bar_dt = pd.Timestamp(window.iloc[-1]["datetime"])
     for signal in reversed(signals):
-        if pd.Timestamp(signal.datetime) == bar_dt and signal.strength >= min_strength:
+        if pd.Timestamp(signal.datetime) == bar_dt:
             return signal
     return None
 
@@ -92,10 +107,10 @@ def run_backtest(
     df: pd.DataFrame,
     *,
     rolling_window: int = 60,
-    min_strength: int = 2,
+    signal_config: SignalConfig | None = None,
     horizons: tuple[int, ...] = (5, 10, 20),
     use_rolling_profile: bool = True,
-    warmup_bars: int = 20,
+    warmup_bars: int | None = None,
 ) -> BacktestResult:
     """
     Walk-forward backtest: profile is built only from past bars (no look-ahead).
@@ -103,16 +118,17 @@ def run_backtest(
     Entry at signal bar close; exit at close N bars later.
     Buy wins when price rises; sell wins when price falls.
     """
-    if df.empty or len(df) < warmup_bars + max(horizons) + 1:
-        empty = tuple(
-            HorizonStats(h, 0, 0.0, 0.0, 0.0) for h in horizons
-        )
+    cfg = signal_config or DEFAULT_SIGNAL_CONFIG
+    warmup = warmup_bars if warmup_bars is not None else max(20, cfg.trend_ma_period)
+
+    if df.empty or len(df) < warmup + max(horizons) + 1:
+        empty = tuple(HorizonStats(h, 0, 0.0, 0.0, 0.0) for h in horizons)
         return BacktestResult(
             outcomes=(),
             horizons=horizons,
             rolling_window=rolling_window,
             use_rolling_profile=use_rolling_profile,
-            min_strength=min_strength,
+            signal_config=cfg,
             overall=empty,
             buy=empty,
             sell=empty,
@@ -121,14 +137,14 @@ def run_backtest(
     max_h = max(horizons)
     outcomes: list[SignalOutcome] = []
 
-    for i in range(warmup_bars, len(df) - max_h):
+    for i in range(warmup, len(df) - max_h):
         if use_rolling_profile:
             start = max(0, i - rolling_window + 1)
             window = df.iloc[start : i + 1].copy()
         else:
             window = df.iloc[: i + 1].copy()
 
-        signal = _signal_at_bar(window, min_strength)
+        signal = _signal_at_bar(window, cfg)
         if signal is None:
             continue
 
@@ -147,7 +163,7 @@ def run_backtest(
                 datetime=signal.datetime,
                 side=signal.side,
                 reason=signal.reason,
-                strength=signal.strength,
+                confluence=signal.confluence,
                 entry_price=entry,
                 returns=returns,
                 wins=wins,
@@ -159,8 +175,33 @@ def run_backtest(
         horizons=horizons,
         rolling_window=rolling_window,
         use_rolling_profile=use_rolling_profile,
-        min_strength=min_strength,
+        signal_config=cfg,
         overall=_summarize(outcomes, None, horizons),
         buy=_summarize(outcomes, "buy", horizons),
         sell=_summarize(outcomes, "sell", horizons),
     )
+
+
+def compare_backtest(
+    df: pd.DataFrame,
+    *,
+    rolling_window: int = 60,
+    horizons: tuple[int, ...] = (5, 10, 20),
+    use_rolling_profile: bool = True,
+) -> tuple[BacktestResult, BacktestResult]:
+    """Run strict (filtered) vs legacy signal rules side by side."""
+    strict = run_backtest(
+        df,
+        rolling_window=rolling_window,
+        signal_config=STRICT_SIGNAL_CONFIG,
+        horizons=horizons,
+        use_rolling_profile=use_rolling_profile,
+    )
+    legacy = run_backtest(
+        df,
+        rolling_window=rolling_window,
+        signal_config=LEGACY_SIGNAL_CONFIG,
+        horizons=horizons,
+        use_rolling_profile=use_rolling_profile,
+    )
+    return strict, legacy

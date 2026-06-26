@@ -12,12 +12,17 @@ from liquidity_map.auto_trader import (
     load_trade_config,
     load_trade_state,
 )
-from liquidity_map.backtest import BacktestResult, run_backtest
+from liquidity_map.backtest import BacktestResult, compare_backtest, run_backtest
 from liquidity_map.chart import ChartOptions, PriceLine, build_chart
 from liquidity_map.data import auto_interval, fetch_bars
 from liquidity_map.paper_broker import get_position_info
 from liquidity_map.profile import build_volume_profile
-from liquidity_map.signals import detect_liquidity_signals
+from liquidity_map.signals import (
+    DEFAULT_SIGNAL_CONFIG,
+    LEGACY_SIGNAL_CONFIG,
+    SignalConfig,
+    detect_liquidity_signals,
+)
 
 PERIOD_OPTIONS = {
     "1 Week": "5d",
@@ -35,12 +40,40 @@ INTERVAL_OPTIONS = {
 }
 
 
+def _build_signal_config(
+    *,
+    require_trend: bool,
+    require_wick: bool,
+    min_confluence: int,
+    edge_only: bool,
+    legacy_mode: bool = False,
+) -> SignalConfig:
+    if legacy_mode:
+        return SignalConfig(
+            require_trend_filter=False,
+            require_rejection_wick=False,
+            min_confluence=1,
+            edge_only=False,
+            volume_spike_pct=0.8,
+        )
+    return SignalConfig(
+        require_trend_filter=require_trend,
+        require_rejection_wick=require_wick,
+        min_confluence=min_confluence,
+        edge_only=edge_only,
+    )
+
+
 @st.cache_data(show_spinner=False)
 def cached_backtest(
     df: pd.DataFrame,
     rolling_window: int,
-    min_strength: int,
     use_rolling_profile: bool,
+    require_trend: bool,
+    require_wick: bool,
+    min_confluence: int,
+    edge_only: bool,
+    legacy_mode: bool,
     h5: bool,
     h10: bool,
     h20: bool,
@@ -54,13 +87,52 @@ def cached_backtest(
         horizons.append(20)
     if not horizons:
         horizons = [10]
+    config = _build_signal_config(
+        require_trend=require_trend,
+        require_wick=require_wick,
+        min_confluence=min_confluence,
+        edge_only=edge_only,
+        legacy_mode=legacy_mode,
+    )
     return run_backtest(
         df.copy(),
         rolling_window=rolling_window,
-        min_strength=min_strength,
+        signal_config=config,
         horizons=tuple(horizons),
         use_rolling_profile=use_rolling_profile,
     )
+
+
+@st.cache_data(show_spinner=False)
+def cached_compare(
+    df: pd.DataFrame,
+    rolling_window: int,
+    use_rolling_profile: bool,
+    h5: bool,
+    h10: bool,
+    h20: bool,
+) -> tuple[BacktestResult, BacktestResult]:
+    horizons: list[int] = []
+    if h5:
+        horizons.append(5)
+    if h10:
+        horizons.append(10)
+    if h20:
+        horizons.append(20)
+    if not horizons:
+        horizons = [10]
+    return compare_backtest(
+        df.copy(),
+        rolling_window=rolling_window,
+        horizons=tuple(horizons),
+        use_rolling_profile=use_rolling_profile,
+    )
+
+
+def _primary_stats(result: BacktestResult) -> tuple[int, object]:
+    primary_h = result.horizons[len(result.horizons) // 2] if result.horizons else 10
+    primary = next((s for s in result.overall if s.horizon == primary_h), result.overall[0])
+    return primary_h, primary
 
 
 def render_chart_tab(
@@ -68,11 +140,11 @@ def render_chart_tab(
     ticker: str,
     *,
     simple_view: bool,
+    signal_config: SignalConfig,
     show_profile: bool,
     show_poc: bool,
     show_value_area: bool,
     show_signals: bool,
-    min_signal_strength: int,
     show_heatmap: bool,
     show_volume: bool,
     show_price_line: bool,
@@ -81,8 +153,7 @@ def render_chart_tab(
 ) -> None:
     profile = build_volume_profile(df, n_bins=80)
     last_price = float(df["close"].iloc[-1])
-    all_signals = detect_liquidity_signals(df, profile) if show_signals else []
-    signals = [s for s in all_signals if s.strength >= min_signal_strength] if show_signals else []
+    all_signals = detect_liquidity_signals(df, profile, config=signal_config) if show_signals else []
 
     trade_state = load_trade_state()
     portfolio = get_paper_portfolio(trade_state, symbol=ticker)
@@ -94,7 +165,10 @@ def render_chart_tab(
     if position:
         c3.metric("Your position", f"{position.qty:.2f} shares", delta=f"${position.pnl:+.0f}")
     elif show_signals:
-        c3.metric("Signals", f"{sum(1 for s in signals if s.side == 'buy')} buy · {sum(1 for s in signals if s.side == 'sell')} sell")
+        c3.metric(
+            "Signals",
+            f"{sum(1 for s in all_signals if s.side == 'buy')} buy · {sum(1 for s in all_signals if s.side == 'sell')} sell",
+        )
     else:
         c3.metric("Value area", f"${profile.val_price:.0f} – ${profile.vah_price:.0f}")
 
@@ -111,7 +185,8 @@ def render_chart_tab(
             show_poc_lines=show_poc,
             show_value_area=show_value_area,
             show_signals=show_signals,
-            min_signal_strength=min_signal_strength,
+            min_confluence=signal_config.min_confluence,
+            signal_config=signal_config,
             show_volume=show_volume,
             price_lines=price_lines,
             position=position,
@@ -122,14 +197,22 @@ def render_chart_tab(
 
     if simple_view:
         st.info(
-            "**How to read this:** The gray bars on the right show where volume traded at each price. "
-            "The orange line is **POC** — the busiest price. "
-            "▲ green = buy at support · ▼ red = sell at resistance. Hover any marker for details."
+            "**Filtered signals** need confluence score ≥ 3 (trend, wick, edge, volume spike, HVN). "
+            "Gray bars = volume profile · Orange = POC · Hover markers for score breakdown."
         )
-    elif show_signals and signals:
-        with st.expander(f"Signal list ({len(signals)})"):
+    elif show_signals and all_signals:
+        with st.expander(f"Signal list ({len(all_signals)})"):
             st.dataframe(
-                [{"Side": s.side.upper(), "Price": f"${s.price:.2f}", "Strength": s.strength, "Reason": s.reason} for s in signals[-15:]],
+                [
+                    {
+                        "Side": s.side.upper(),
+                        "Price": f"${s.price:.2f}",
+                        "Score": f"{s.confluence}/5",
+                        "Tags": ", ".join(s.tags),
+                        "Reason": s.reason,
+                    }
+                    for s in all_signals[-15:]
+                ],
                 width="stretch",
                 hide_index=True,
             )
@@ -142,109 +225,108 @@ def render_chart_tab(
             st.write(f"**{result.action.upper()}** — {result.message}")
 
 
-def render_backtest_tab(df: pd.DataFrame, ticker: str) -> None:
+def _render_backtest_results(result: BacktestResult, label: str | None = None) -> None:
+    n = len(result.outcomes)
+    if label:
+        st.markdown(f"**{label}**")
+
+    if n == 0:
+        st.warning("No signals matched these rules.")
+        return
+
+    primary_h, primary = _primary_stats(result)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Trades", n)
+    m2.metric(f"Win rate @ {primary_h} bars", f"{primary.win_rate:.1f}%")
+    m3.metric(f"Avg return @ {primary_h} bars", f"{primary.avg_return_pct:+.2f}%")
+    m4.metric(f"Median @ {primary_h} bars", f"{primary.median_return_pct:+.2f}%")
+
+    table = pd.DataFrame(
+        [
+            {
+                "Group": "All",
+                "Bars": s.horizon,
+                "Trades": s.n,
+                "Win %": round(s.win_rate, 1),
+                "Avg %": round(s.avg_return_pct, 2),
+            }
+            for s in result.overall
+            if s.n > 0
+        ]
+    )
+    if not table.empty:
+        st.dataframe(table, width="stretch", hide_index=True)
+
+
+def render_backtest_tab(df: pd.DataFrame, ticker: str, signal_config: SignalConfig) -> None:
     st.caption(
-        "Walk-forward test: each signal uses only **past** bars to build the profile (no look-ahead). "
-        "Entry at signal close; exit at close N bars later."
+        "Walk-forward test using past bars only. Signals require confluence from: "
+        "**edge level · trend · wick · volume spike · HVN**."
     )
 
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3 = st.columns(3)
     with c1:
         rolling_window = st.number_input("Profile lookback (bars)", min_value=10, max_value=252, value=60, step=5)
     with c2:
-        bt_min_strength = st.slider("Min strength", 1, 3, 2, key="bt_strength")
-    with c3:
         use_rolling = st.checkbox("Rolling profile (recommended)", value=True)
+    with c3:
+        compare_modes = st.checkbox("Compare strict vs legacy", value=True)
+
+    c4, c5, c6, c7 = st.columns(4)
     with c4:
-        st.write("Hold periods (bars)")
-        h5 = st.checkbox("5 bars", value=True, key="h5")
-        h10 = st.checkbox("10 bars", value=True, key="h10")
-        h20 = st.checkbox("20 bars", value=True, key="h20")
+        bt_min_confluence = st.slider("Min confluence", 1, 5, signal_config.min_confluence, key="bt_conf")
+    with c5:
+        bt_trend = st.checkbox("Require trend", value=signal_config.require_trend_filter, key="bt_trend")
+    with c6:
+        bt_wick = st.checkbox("Require wick", value=signal_config.require_rejection_wick, key="bt_wick")
+    with c7:
+        st.write("Hold periods")
+        h5 = st.checkbox("5", value=True, key="h5")
+        h10 = st.checkbox("10", value=True, key="h10")
+        h20 = st.checkbox("20", value=True, key="h20")
 
     with st.spinner("Running backtest…"):
-        result = cached_backtest(
-            df,
-            rolling_window,
-            bt_min_strength,
-            use_rolling,
-            h5,
-            h10,
-            h20,
-        )
+        if compare_modes:
+            strict, legacy = cached_compare(df, rolling_window, use_rolling, h5, h10, h20)
+            col_a, col_b = st.columns(2)
+            with col_a:
+                _render_backtest_results(strict, "Strict (trend + wick + score ≥ 3)")
+            with col_b:
+                _render_backtest_results(legacy, "Legacy (old rules)")
+        else:
+            result = cached_backtest(
+                df,
+                rolling_window,
+                use_rolling,
+                bt_trend,
+                bt_wick,
+                bt_min_confluence,
+                signal_config.edge_only,
+                legacy_mode=False,
+                h5=h5,
+                h10=h10,
+                h20=h20,
+            )
+            _render_backtest_results(result)
 
-    n = len(result.outcomes)
-    n_buy = sum(1 for o in result.outcomes if o.side == "buy")
-    n_sell = n - n_buy
-
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Signals tested", n)
-    m2.metric("Buys", n_buy)
-    m3.metric("Sells", n_sell)
-
-    if n == 0:
-        st.warning("Not enough data for this settings combo. Try a longer range or lower min strength.")
-        return
-
-    primary_h = result.horizons[len(result.horizons) // 2] if result.horizons else 10
-    primary = next((s for s in result.overall if s.horizon == primary_h), result.overall[0])
-
-    s1, s2, s3 = st.columns(3)
-    s1.metric(f"Win rate @ {primary.horizon} bars", f"{primary.win_rate:.1f}%")
-    s2.metric(f"Avg return @ {primary.horizon} bars", f"{primary.avg_return_pct:+.2f}%")
-    s3.metric(f"Median return @ {primary.horizon} bars", f"{primary.median_return_pct:+.2f}%")
-
-    st.subheader("Results by hold period")
-
-    def _stats_table(label: str, rows: tuple) -> pd.DataFrame:
-        return pd.DataFrame(
-            [
-                {
-                    "Group": label,
-                    "Bars": s.horizon,
-                    "Trades": s.n,
-                    "Win %": round(s.win_rate, 1),
-                    "Avg %": round(s.avg_return_pct, 2),
-                    "Median %": round(s.median_return_pct, 2),
-                }
-                for s in rows
-                if s.n > 0
-            ]
-        )
-
-    tables = []
-    for label, rows in [("All", result.overall), ("Buy", result.buy), ("Sell", result.sell)]:
-        t = _stats_table(label, rows)
-        if not t.empty:
-            tables.append(t)
-    if tables:
-        st.dataframe(pd.concat(tables, ignore_index=True), width="stretch", hide_index=True)
-
-    chart_df = pd.DataFrame(
-        [{"Bars": s.horizon, "Win %": s.win_rate, "Avg return %": s.avg_return_pct} for s in result.overall if s.n > 0]
-    )
-    if not chart_df.empty:
-        st.bar_chart(chart_df.set_index("Bars")[["Win %", "Avg return %"]])
-
-    with st.expander(f"Trade log ({n} signals)"):
-        log_rows = []
-        for o in result.outcomes:
-            row = {
-                "Date": pd.Timestamp(o.datetime).strftime("%Y-%m-%d %H:%M"),
-                "Side": o.side.upper(),
-                "Entry": f"${o.entry_price:.2f}",
-                "Strength": o.strength,
-                "Reason": o.reason,
-            }
-            for h in result.horizons:
-                if h in o.returns:
-                    row[f"{h}bar %"] = f"{o.returns[h]:+.2f}%"
-            log_rows.append(row)
-        st.dataframe(log_rows, width="stretch", hide_index=True)
+            with st.expander(f"Trade log ({len(result.outcomes)})"):
+                log_rows = []
+                for o in result.outcomes:
+                    row = {
+                        "Date": pd.Timestamp(o.datetime).strftime("%Y-%m-%d %H:%M"),
+                        "Side": o.side.upper(),
+                        "Entry": f"${o.entry_price:.2f}",
+                        "Score": o.confluence,
+                        "Reason": o.reason,
+                    }
+                    for h in result.horizons:
+                        if h in o.returns:
+                            row[f"{h}bar %"] = f"{o.returns[h]:+.2f}%"
+                    log_rows.append(row)
+                st.dataframe(log_rows, width="stretch", hide_index=True)
 
     if not use_rolling:
-        st.warning(
-            "Full-period profile mode includes future volume in the POC — historical results look better than live trading would."
-        )
+        st.warning("Full-period profile includes future volume — results look better than live trading would.")
 
 
 def main() -> None:
@@ -258,28 +340,40 @@ def main() -> None:
         interval = interval or auto_interval(period)
 
         st.divider()
-        simple_view = st.toggle("Simple view", value=True, help="Candles, volume profile, POC line, and strong signals only.")
+        st.subheader("Signal filters")
+        simple_view = st.toggle("Simple view", value=True)
 
         if simple_view:
+            signal_config = DEFAULT_SIGNAL_CONFIG
             show_profile = True
             show_poc = True
             show_value_area = False
             show_signals = True
-            min_signal_strength = 2
             show_heatmap = False
             show_volume = False
             show_price_line = False
             price_line_value = 0.0
             auto_trade = False
+            st.caption("Score ≥ 3 from trend, wick, edge, volume, HVN · VAL/VAH/POC only")
         else:
-            with st.expander("Chart layers", expanded=True):
+            require_trend = st.checkbox("Require trend (50 MA)", value=True)
+            require_wick = st.checkbox("Require rejection wick", value=True)
+            min_confluence = st.slider("Min confluence score", 1, 5, 3)
+            edge_only = st.checkbox("Edge levels only (VAL/VAH/POC)", value=True)
+            signal_config = _build_signal_config(
+                require_trend=require_trend,
+                require_wick=require_wick,
+                min_confluence=min_confluence,
+                edge_only=edge_only,
+            )
+
+            with st.expander("Chart layers", expanded=False):
                 show_profile = st.checkbox("Volume profile", value=True)
                 show_poc = st.checkbox("POC / value area lines", value=True)
                 show_value_area = show_poc
                 show_signals = st.checkbox("Buy & sell markers", value=True)
                 show_heatmap = st.checkbox("Liquidity heatmap", value=False)
                 show_volume = st.checkbox("Volume bars", value=True)
-                min_signal_strength = st.slider("Min signal strength", 1, 3, 1)
 
             show_price_line = st.checkbox("Custom price line", value=False)
             price_line_value = 0.0
@@ -305,11 +399,11 @@ def main() -> None:
             df,
             ticker,
             simple_view=simple_view,
+            signal_config=signal_config,
             show_profile=show_profile,
             show_poc=show_poc,
             show_value_area=show_value_area,
             show_signals=show_signals,
-            min_signal_strength=min_signal_strength,
             show_heatmap=show_heatmap,
             show_volume=show_volume,
             show_price_line=show_price_line,
@@ -318,7 +412,7 @@ def main() -> None:
         )
 
     with backtest_tab:
-        render_backtest_tab(df, ticker)
+        render_backtest_tab(df, ticker, signal_config)
 
 
 if __name__ == "__main__":

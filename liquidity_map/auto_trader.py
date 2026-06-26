@@ -23,7 +23,12 @@ from liquidity_map.paper_broker import (
     portfolio_value,
 )
 from liquidity_map.profile import VolumeProfile, build_volume_profile
-from liquidity_map.signals import LiquiditySignal, detect_liquidity_signals
+from liquidity_map.signals import (
+    DEFAULT_SIGNAL_CONFIG,
+    LiquiditySignal,
+    SignalConfig,
+    detect_liquidity_signals,
+)
 
 ET = ZoneInfo("America/New_York")
 STATE_FILE = Path(__file__).resolve().parent.parent / ".trade_state.json"
@@ -35,7 +40,8 @@ Action = Literal["buy", "sell", "hold", "skip"]
 class TradeConfig:
     dry_run: bool = True
     trade_amount_usd: float = 100.0
-    min_strength: int = 2
+    min_confluence: int = 3
+    signal_config: SignalConfig = field(default_factory=lambda: DEFAULT_SIGNAL_CONFIG)
     max_daily_trades: int = 5
     require_liquid_spread: bool = False
     sell_full_position: bool = True
@@ -79,7 +85,7 @@ def load_trade_config() -> TradeConfig:
     return TradeConfig(
         dry_run=_env_bool("AUTO_TRADE_DRY_RUN", False),
         trade_amount_usd=float(os.getenv("AUTO_TRADE_AMOUNT_USD", "100")),
-        min_strength=int(os.getenv("AUTO_TRADE_MIN_STRENGTH", "2")),
+        min_confluence=int(os.getenv("AUTO_TRADE_MIN_CONFLUENCE", os.getenv("AUTO_TRADE_MIN_STRENGTH", "3"))),
         max_daily_trades=int(os.getenv("AUTO_TRADE_MAX_DAILY", "5")),
         require_liquid_spread=_env_bool("AUTO_TRADE_REQUIRE_LIQUID_SPREAD", False),
         paper_starting_cash=float(os.getenv("PAPER_STARTING_CASH", "10000")),
@@ -152,20 +158,33 @@ def _reset_daily_counter(state: TradeState) -> None:
 def get_actionable_signal(
     df: pd.DataFrame,
     profile: VolumeProfile,
-    min_strength: int = 2,
+    min_confluence: int = 3,
     use_confirmed_bar: bool = True,
+    signal_config: SignalConfig | None = None,
 ) -> LiquiditySignal | None:
     if len(df) < 2:
         return None
 
-    signals = detect_liquidity_signals(df, profile)
+    base = signal_config or DEFAULT_SIGNAL_CONFIG
+    cfg = SignalConfig(
+        require_trend_filter=base.require_trend_filter,
+        require_rejection_wick=base.require_rejection_wick,
+        trend_ma_period=base.trend_ma_period,
+        volume_spike_pct=base.volume_spike_pct,
+        min_volume_pct=base.min_volume_pct,
+        min_confluence=min_confluence,
+        cooldown_bars=base.cooldown_bars,
+        edge_only=base.edge_only,
+        wick_ratio=base.wick_ratio,
+    )
+    signals = detect_liquidity_signals(df, profile, config=cfg)
     if not signals:
         return None
 
     bar_dt = df["datetime"].iloc[-2 if use_confirmed_bar else -1]
     bar_ts = pd.Timestamp(bar_dt)
     for signal in reversed(signals):
-        if pd.Timestamp(signal.datetime) == bar_ts and signal.strength >= min_strength:
+        if pd.Timestamp(signal.datetime) == bar_ts:
             return signal
     return None
 
@@ -198,7 +217,13 @@ def evaluate_and_trade(
         return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=cfg.dry_run)
 
     profile = build_volume_profile(df)
-    signal = get_actionable_signal(df, profile, cfg.min_strength, cfg.use_confirmed_bar)
+    signal = get_actionable_signal(
+        df,
+        profile,
+        cfg.min_confluence,
+        cfg.use_confirmed_bar,
+        cfg.signal_config,
+    )
     if signal is None:
         return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=cfg.dry_run)
 
@@ -248,7 +273,7 @@ def evaluate_and_trade(
         "symbol": sym,
         "action": action,
         "signal_reason": signal.reason,
-        "signal_strength": signal.strength,
+        "signal_confluence": signal.confluence,
         "order_id": order_id,
         "price": price,
         "amount_usd": cfg.trade_amount_usd if action == "buy" else round(sell_proceeds, 2) if action == "sell" else 0,

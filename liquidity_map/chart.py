@@ -13,7 +13,12 @@ from liquidity_map.data import Quote
 from liquidity_map.paper_broker import PositionInfo
 from liquidity_map.heatmap import build_liquidity_heatmap
 from liquidity_map.profile import VolumeProfile, build_volume_profile
-from liquidity_map.signals import LiquiditySignal, detect_liquidity_signals
+from liquidity_map.signals import (
+    DEFAULT_SIGNAL_CONFIG,
+    LiquiditySignal,
+    SignalConfig,
+    detect_liquidity_signals,
+)
 
 
 @dataclass(frozen=True)
@@ -31,7 +36,8 @@ class ChartOptions:
     show_poc_lines: bool = True
     show_value_area: bool = True
     show_signals: bool = True
-    min_signal_strength: int = 1
+    min_confluence: int = 3
+    signal_config: SignalConfig = DEFAULT_SIGNAL_CONFIG
     show_volume: bool = True
     n_bins: int = 80
     price_lines: tuple[PriceLine, ...] = ()
@@ -115,7 +121,13 @@ def build_chart(df: pd.DataFrame, ticker: str, options: ChartOptions) -> go.Figu
         _add_level(fig, pos.avg_price, f"Entry ${pos.avg_price:.2f}", "#38bdf8", "solid", width=2.5)
 
     if options.show_signals:
-        _add_signal_markers(fig, df, profile, min_strength=options.min_signal_strength)
+        _add_signal_markers(
+            fig,
+            df,
+            profile,
+            config=options.signal_config,
+            min_confluence=options.min_confluence,
+        )
 
     if options.show_volume:
         fig.add_trace(
@@ -199,9 +211,21 @@ def _add_signal_markers(
     df: pd.DataFrame,
     profile: VolumeProfile,
     *,
-    min_strength: int = 1,
+    config: SignalConfig = DEFAULT_SIGNAL_CONFIG,
+    min_confluence: int = 3,
 ) -> None:
-    signals = [s for s in detect_liquidity_signals(df, profile) if s.strength >= min_strength]
+    cfg = SignalConfig(
+        require_trend_filter=config.require_trend_filter,
+        require_rejection_wick=config.require_rejection_wick,
+        trend_ma_period=config.trend_ma_period,
+        volume_spike_pct=config.volume_spike_pct,
+        min_volume_pct=config.min_volume_pct,
+        min_confluence=min_confluence,
+        cooldown_bars=config.cooldown_bars,
+        edge_only=config.edge_only,
+        wick_ratio=config.wick_ratio,
+    )
+    signals = detect_liquidity_signals(df, profile, config=cfg)
     bars = _bar_lookup(df)
     buys = [s for s in signals if s.side == "buy"]
     sells = [s for s in signals if s.side == "sell"]
@@ -218,8 +242,8 @@ def _add_signal_markers(
                 mode="markers",
                 name="Buy",
                 marker=dict(symbol="triangle-up", size=16, color="#16a34a", line=dict(width=1.5, color="#fff")),
-                customdata=[s.reason for s in buys],
-                hovertemplate="<b>Buy</b> $%{y:.2f}<br>%{customdata}<extra></extra>",
+                customdata=[[s.confluence, s.reason] for s in buys],
+                hovertemplate="<b>Buy</b> $%{y:.2f}<br>Score %{customdata[0]}/5<br>%{customdata[1]}<extra></extra>",
             ),
             row=1,
             col=1,
@@ -233,8 +257,8 @@ def _add_signal_markers(
                 mode="markers",
                 name="Sell",
                 marker=dict(symbol="triangle-down", size=16, color="#dc2626", line=dict(width=1.5, color="#fff")),
-                customdata=[s.reason for s in sells],
-                hovertemplate="<b>Sell</b> $%{y:.2f}<br>%{customdata}<extra></extra>",
+                customdata=[[s.confluence, s.reason] for s in sells],
+                hovertemplate="<b>Sell</b> $%{y:.2f}<br>Score %{customdata[0]}/5<br>%{customdata[1]}<extra></extra>",
             ),
             row=1,
             col=1,
