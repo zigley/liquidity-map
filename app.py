@@ -14,7 +14,7 @@ from liquidity_map.auto_trader import (
 )
 from liquidity_map.backtest import BacktestResult, compare_backtest, run_backtest
 from liquidity_map.chart import ChartOptions, PriceLine, build_chart
-from liquidity_map.data import auto_interval, fetch_bars
+from liquidity_map.data import auto_interval, fetch_bars, resolve_ticker
 from liquidity_map.paper_broker import get_position_info
 from liquidity_map.profile import build_volume_profile
 from liquidity_map.signals import (
@@ -391,6 +391,10 @@ def main() -> None:
     except Exception as exc:
         st.error(f"Could not load {ticker}: {exc}")
         return
+
+    yahoo_symbol = resolve_ticker(ticker)
+    if yahoo_symbol != ticker:
+        st.caption(f"Using Yahoo symbol **{yahoo_symbol}** for index volume data.")
 
     chart_tab, backtest_tab = st.tabs(["Chart", "Backtest"])
 

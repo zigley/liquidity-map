@@ -24,6 +24,23 @@ INTERVAL_BY_PERIOD: dict[str, str] = {
     "max": "1mo",
 }
 
+# Yahoo Finance index symbols need a ^ prefix and/or alias for volume data.
+TICKER_ALIASES: dict[str, str] = {
+    "NDX": "^NDX",
+    "NASDAQ100": "^NDX",
+    "NAS100": "^NDX",
+    "SPX": "^GSPC",
+    "SP500": "^GSPC",
+    "S&P500": "^GSPC",
+    "GSPC": "^GSPC",
+    "DJI": "^DJI",
+    "DOW": "^DJI",
+    "RUT": "^RUT",
+    "VIX": "^VIX",
+    "IXIC": "^IXIC",
+    "COMP": "^IXIC",
+}
+
 
 @dataclass(frozen=True)
 class Quote:
@@ -38,23 +55,26 @@ def auto_interval(period: str) -> str:
     return INTERVAL_BY_PERIOD.get(period, "1d")
 
 
-def fetch_bars(
-    ticker: str,
-    period: str = "3mo",
-    interval: str | None = None,
-    start: str | None = None,
-    end: str | None = None,
-) -> pd.DataFrame:
-    """Fetch OHLCV bars via yfinance."""
+def resolve_ticker(ticker: str) -> str:
+    """Map user-facing symbols to Yahoo Finance symbols with usable OHLCV."""
     symbol = ticker.strip().upper()
-    chosen_interval = interval or auto_interval(period)
+    return TICKER_ALIASES.get(symbol, symbol)
 
+
+def _download_bars(
+    symbol: str,
+    *,
+    period: str,
+    interval: str,
+    start: str | None,
+    end: str | None,
+) -> pd.DataFrame:
     if start:
         raw = yf.download(
             symbol,
             start=start,
             end=end,
-            interval=chosen_interval,
+            interval=interval,
             auto_adjust=True,
             progress=False,
             threads=False,
@@ -63,14 +83,14 @@ def fetch_bars(
         raw = yf.download(
             symbol,
             period=period,
-            interval=chosen_interval,
+            interval=interval,
             auto_adjust=True,
             progress=False,
             threads=False,
         )
 
     if raw.empty:
-        raise ValueError(f"No data returned for {symbol}")
+        return raw
 
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = [col[0].lower() for col in raw.columns]
@@ -95,13 +115,52 @@ def fetch_bars(
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["volume"] = pd.to_numeric(df["volume"], errors="coerce").fillna(0).astype(float)
 
-    df = df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+    return df.dropna(subset=["open", "high", "low", "close"]).sort_values("datetime").reset_index(drop=True)
+
+
+def fetch_bars(
+    ticker: str,
+    period: str = "3mo",
+    interval: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> pd.DataFrame:
+    """Fetch OHLCV bars via yfinance."""
+    display = ticker.strip().upper()
+    symbol = resolve_ticker(display)
+    chosen_interval = interval or auto_interval(period)
+
+    df = _download_bars(
+        symbol,
+        period=period,
+        interval=chosen_interval,
+        start=start,
+        end=end,
+    )
+
+    # NDX and some indices return prices but zero volume without the ^ prefix.
+    if not df.empty and float(df["volume"].sum()) <= 0:
+        caret = symbol if symbol.startswith("^") else f"^{symbol.lstrip('^')}"
+        if caret != symbol:
+            alt = _download_bars(
+                caret,
+                period=period,
+                interval=chosen_interval,
+                start=start,
+                end=end,
+            )
+            if not alt.empty and float(alt["volume"].sum()) > 0:
+                df = alt
+
+    if df.empty:
+        raise ValueError(f"No data returned for {display} (tried {symbol})")
+
     return df[["datetime", "open", "high", "low", "close", "volume"]]
 
 
 def fetch_quote(ticker: str) -> Quote:
     """Best-effort bid/ask from yfinance (may be absent for some symbols)."""
-    symbol = ticker.strip().upper()
+    symbol = resolve_ticker(ticker)
     info = yf.Ticker(symbol).fast_info
     bid = getattr(info, "last_price", None)
     last = bid
