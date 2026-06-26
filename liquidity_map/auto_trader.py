@@ -12,8 +12,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from liquidity_map.data import is_crypto
-from liquidity_map.model import DEFAULT_CONFIG, adapt_config, live_advice
+from liquidity_map.data import fetch_bars, is_crypto
+from liquidity_map.model import build_config, live_advice
 from liquidity_map.paper_broker import (
     PaperPortfolio,
     get_position_qty,
@@ -163,8 +163,20 @@ def evaluate_and_trade(
         peak = max(peak, float(df["high"].iloc[-1]), price)
         st.peak_prices[sym] = peak
 
-    model_cfg = adapt_config("3mo", len(df), DEFAULT_CONFIG)
-    advice = live_advice(df, in_position=in_pos, entry_price=entry, peak_price=peak, cfg=model_cfg)
+    try:
+        trend_df = fetch_bars(sym, period="1y", interval="1d")
+    except Exception:
+        trend_df = df
+    model_cfg = build_config(sym, "3mo", len(df), strictness=3)
+    advice = live_advice(
+        df,
+        in_position=in_pos,
+        entry_price=entry,
+        peak_price=peak,
+        cfg=model_cfg,
+        ticker=sym,
+        trend_df=trend_df,
+    )
 
     if advice.action == "wait":
         return TradeResult("hold", sym, advice.reason, cfg.dry_run)

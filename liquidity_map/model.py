@@ -15,7 +15,12 @@ from typing import Literal
 import numpy as np
 import pandas as pd
 
+from liquidity_map.data import is_crypto
 from liquidity_map.profile import VolumeProfile, build_volume_profile
+
+LONG_TREND_MA = 200
+CRYPTO_TRAIL_PCT = 2.75
+CRYPTO_TRAIL_AFTER_VAH_PCT = 2.0
 
 Action = Literal["buy", "sell", "wait"]
 Side = Literal["buy", "sell"]
@@ -100,6 +105,43 @@ def _trend_up(close: float, ma: float) -> bool:
     return np.isnan(ma) or close > ma
 
 
+def _long_trend_period(available_bars: int) -> int:
+    if available_bars >= LONG_TREND_MA:
+        return LONG_TREND_MA
+    if available_bars >= 50:
+        return 50
+    return 0
+
+
+def _long_trend_ok(df: pd.DataFrame, idx: int) -> tuple[bool, int]:
+    """True when price is above the long-term (200-day) average."""
+    period = _long_trend_period(idx + 1)
+    if period == 0:
+        return True, 0
+    window = df["close"].iloc[: idx + 1]
+    ma = float(window.rolling(period, min_periods=period).mean().iloc[-1])
+    close = float(window.iloc[-1])
+    return _trend_up(close, ma), period
+
+
+def apply_asset_tuning(cfg: ModelConfig, ticker: str) -> ModelConfig:
+    """Wider trail stops for volatile crypto."""
+    if not is_crypto(ticker):
+        return cfg
+    return ModelConfig(
+        trend_ma=cfg.trend_ma,
+        profile_lookback=cfg.profile_lookback,
+        trail_pct=max(cfg.trail_pct, CRYPTO_TRAIL_PCT),
+        trail_pct_after_vah=max(cfg.trail_pct_after_vah, CRYPTO_TRAIL_AFTER_VAH_PCT),
+        min_gain_for_trail=cfg.min_gain_for_trail,
+        min_vah_gain_pct=cfg.min_vah_gain_pct,
+        wick_ratio=cfg.wick_ratio,
+        volume_mult=cfg.volume_mult,
+        level_tolerance=cfg.level_tolerance,
+        cooldown_bars=cfg.cooldown_bars,
+    )
+
+
 def _entry_trigger(
     o: float,
     h: float,
@@ -155,11 +197,13 @@ def _exit_trigger(
     if target is not None and h >= target:
         return True, f"Hit the profit target (${target:.2f}) — time to sell."
     if stop is not None and c <= stop:
-        return True, f"Price fell {cfg.trail_pct:.1f}% from its high — sell to protect gains."
+        trail_used = cfg.trail_pct_after_vah if peak >= profile.vah_price >= entry else cfg.trail_pct
+        return True, f"Price fell {trail_used:.1f}% from its high — sell to protect gains."
     return False, ""
 
 
-def scan_trades(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG) -> list[TradeMarker]:
+def scan_trades(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG, *, ticker: str = "") -> list[TradeMarker]:
+    cfg = apply_asset_tuning(cfg, ticker)
     """Walk-forward history: buy at support, sell on trail/target."""
     if len(df) < 30:
         return []
@@ -187,8 +231,9 @@ def scan_trades(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG) -> list[Tra
         if not in_trade:
             if i - last_buy_idx < cfg.cooldown_bars:
                 continue
+            long_ok, _ = _long_trend_ok(df, i)
             hit, reason = _entry_trigger(o, h, l, c, vol, profile, ma, median_vol, cfg)
-            if hit:
+            if hit and long_ok:
                 buy_n += 1
                 markers.append(
                     TradeMarker(
@@ -228,7 +273,11 @@ def live_advice(
     entry_price: float | None = None,
     peak_price: float | None = None,
     cfg: ModelConfig = DEFAULT_CONFIG,
+    ticker: str = "",
+    trend_df: pd.DataFrame | None = None,
 ) -> TradeAdvice:
+    cfg = apply_asset_tuning(cfg, ticker)
+    trend_source = trend_df if trend_df is not None and len(trend_df) > len(df) else df
     """What to do right now on the latest bar."""
     if df.empty:
         return TradeAdvice("wait", "No data", 0.0)
@@ -289,7 +338,28 @@ def live_advice(
             vah=profile.vah_price,
         )
 
+    long_ok, long_period = _long_trend_ok(trend_source, len(trend_source) - 1)
+    long_ma = (
+        float(trend_source["close"].rolling(long_period, min_periods=long_period).mean().iloc[-1])
+        if long_period > 0
+        else float("nan")
+    )
+
     hit, reason = _entry_trigger(o, h, l, c, vol, profile, ma, median_vol, cfg)
+    if hit and not long_ok:
+        label = f"{long_period}-day" if long_period == LONG_TREND_MA else f"{long_period}-bar"
+        return TradeAdvice(
+            action="wait",
+            reason=(
+                f"Bounce looks good, but big-picture trend is down (below {label} average "
+                f"${long_ma:.2f}) — skip new buys until price is above that."
+            ),
+            price=price,
+            poc=profile.poc_price,
+            val=profile.val_price,
+            vah=profile.vah_price,
+        )
+
     if hit:
         return TradeAdvice(
             action="buy",
@@ -297,6 +367,17 @@ def live_advice(
             price=price,
             target=profile.vah_price if profile.vah_price > price else None,
             stop=None,
+            poc=profile.poc_price,
+            val=profile.val_price,
+            vah=profile.vah_price,
+        )
+
+    if not long_ok:
+        label = f"{long_period}-day" if long_period == LONG_TREND_MA else f"{long_period}-bar"
+        return TradeAdvice(
+            action="wait",
+            reason=f"Big-picture trend is down (below {label} average) — no new buys for now.",
+            price=price,
             poc=profile.poc_price,
             val=profile.val_price,
             vah=profile.vah_price,
@@ -325,9 +406,21 @@ def live_advice(
     )
 
 
-def backtest(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG) -> BacktestStats:
+def long_trend_status(trend_df: pd.DataFrame) -> tuple[str, float, float]:
+    """Returns (label, price, long_ma) for display — e.g. ('Up', price, ma)."""
+    if trend_df.empty:
+        return "Unknown", 0.0, 0.0
+    ok, period = _long_trend_ok(trend_df, len(trend_df) - 1)
+    price = float(trend_df["close"].iloc[-1])
+    if period == 0:
+        return "Unknown", price, 0.0
+    ma = float(trend_df["close"].rolling(period, min_periods=period).mean().iloc[-1])
+    return ("Up" if ok else "Down", price, ma)
+
+
+def backtest(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG, *, ticker: str = "") -> BacktestStats:
     """Round-trip stats from walk-forward scan."""
-    markers = scan_trades(df, cfg)
+    markers = scan_trades(df, cfg, ticker=ticker)
     buys = [m for m in markers if m.action == "buy"]
     sells = [m for m in markers if m.action == "sell"]
     n = min(len(buys), len(sells))
@@ -386,6 +479,11 @@ def config_for_strictness(level: int) -> ModelConfig:
         cooldown_bars=round(pick("cooldown_bars")),
         min_vah_gain_pct=pick("min_vah_gain_pct"),
     )
+
+
+def build_config(ticker: str, period: str, n_bars: int, strictness: int) -> ModelConfig:
+    """Pickiness + intraday tuning + crypto trail width."""
+    return apply_asset_tuning(adapt_config(period, n_bars, config_for_strictness(strictness)), ticker)
 
 
 def adapt_config(period: str, n_bars: int, cfg: ModelConfig = DEFAULT_CONFIG) -> ModelConfig:
