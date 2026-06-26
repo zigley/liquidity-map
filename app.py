@@ -8,7 +8,7 @@ import streamlit as st
 
 from liquidity_map.auto_trader import evaluate_and_trade, get_paper_portfolio, load_trade_state
 from liquidity_map.chart import ChartLines, build_chart
-from liquidity_map.data import auto_interval, fetch_bars, resolve_ticker
+from liquidity_map.data import auto_interval, fetch_bars, is_crypto, resolve_ticker
 from liquidity_map.model import (
     STRICTNESS_LABELS,
     adapt_config,
@@ -26,6 +26,11 @@ RANGES = {
     "3 Months": "3mo",
     "6 Months": "6mo",
     "1 Year": "1y",
+}
+
+CRYPTO_PICKS = {
+    "Bitcoin (BTC)": "BTC",
+    "Ethereum (ETH)": "ETH",
 }
 
 
@@ -48,7 +53,19 @@ def main() -> None:
     st.title("Should I buy or sell?")
 
     with st.sidebar:
-        ticker = st.text_input("Stock symbol", "SPY").strip().upper()
+        st.caption("Stocks or crypto")
+        pick = st.selectbox(
+            "Quick pick",
+            ["SPY", "Bitcoin (BTC)", "Ethereum (ETH)", "Custom symbol…"],
+        )
+        if pick == "Custom symbol…":
+            ticker = st.text_input("Symbol", "SPY").strip().upper()
+        elif pick == "SPY":
+            ticker = "SPY"
+            st.caption("Symbol: **SPY**")
+        else:
+            ticker = CRYPTO_PICKS[pick]
+            st.caption(f"Symbol: **{ticker}**")
         period = RANGES[st.selectbox("How far back to look", list(RANGES.keys()), index=3)]
 
         st.divider()
@@ -82,7 +99,10 @@ def main() -> None:
         return
 
     yahoo = resolve_ticker(ticker)
-    if yahoo != ticker:
+    crypto = is_crypto(ticker)
+    if crypto:
+        st.caption("Crypto — trades 24/7")
+    elif yahoo != ticker:
         st.caption(f"Loading data as {yahoo}")
 
     cfg = adapt_config(period, len(df), config_for_strictness(strictness))

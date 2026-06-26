@@ -39,7 +39,21 @@ TICKER_ALIASES: dict[str, str] = {
     "VIX": "^VIX",
     "IXIC": "^IXIC",
     "COMP": "^IXIC",
+    # Crypto (Yahoo uses -USD pairs)
+    "BTC": "BTC-USD",
+    "BITCOIN": "BTC-USD",
+    "XBT": "BTC-USD",
+    "ETH": "ETH-USD",
+    "ETHEREUM": "ETH-USD",
 }
+
+CRYPTO_YAHOO_SYMBOLS = frozenset({"BTC-USD", "ETH-USD"})
+
+
+def is_crypto(ticker: str) -> bool:
+    """True for Bitcoin, Ethereum, and other -USD crypto pairs."""
+    resolved = resolve_ticker(ticker.strip().upper())
+    return resolved in CRYPTO_YAHOO_SYMBOLS or resolved.endswith("-USD") and not resolved.startswith("^")
 
 
 @dataclass(frozen=True)

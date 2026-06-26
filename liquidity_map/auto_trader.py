@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from liquidity_map.data import is_crypto
 from liquidity_map.model import DEFAULT_CONFIG, adapt_config, live_advice
 from liquidity_map.paper_broker import (
     PaperPortfolio,
@@ -150,7 +151,7 @@ def evaluate_and_trade(
     price = last_price(df)
     _reset_daily(st)
 
-    if not _market_open():
+    if not is_crypto(sym) and not _market_open():
         return TradeResult("skip", sym, "Market closed (9:30–16:00 ET)", cfg.dry_run)
 
     portfolio = get_paper_portfolio(st, sym)
