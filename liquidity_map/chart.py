@@ -18,6 +18,7 @@ from liquidity_map.signals import (
     LiquiditySignal,
     SignalConfig,
     detect_liquidity_signals,
+    filter_alternating_signals,
 )
 
 
@@ -225,7 +226,8 @@ def _add_signal_markers(
         edge_only=config.edge_only,
         wick_ratio=config.wick_ratio,
     )
-    signals = detect_liquidity_signals(df, profile, config=cfg)
+    raw = detect_liquidity_signals(df, profile, config=cfg)
+    signals = filter_alternating_signals(raw, start_with="buy")
     bars = _bar_lookup(df)
     buys = [s for s in signals if s.side == "buy"]
     sells = [s for s in signals if s.side == "sell"]
@@ -239,11 +241,14 @@ def _add_signal_markers(
             go.Scatter(
                 x=[s.datetime for s in buys],
                 y=[_y(s, "low") for s in buys],
-                mode="markers",
+                mode="markers+text",
                 name="Buy",
+                text=[s.trade_label for s in buys],
+                textposition="bottom center",
+                textfont=dict(size=11, color="#16a34a"),
                 marker=dict(symbol="triangle-up", size=16, color="#16a34a", line=dict(width=1.5, color="#fff")),
-                customdata=[[s.confluence, s.reason] for s in buys],
-                hovertemplate="<b>Buy</b> $%{y:.2f}<br>Score %{customdata[0]}/5<br>%{customdata[1]}<extra></extra>",
+                customdata=[[s.trade_label, s.confluence, s.reason] for s in buys],
+                hovertemplate="<b>%{customdata[0]} Buy</b> $%{y:.2f}<br>Score %{customdata[1]}/5<br>%{customdata[2]}<extra></extra>",
             ),
             row=1,
             col=1,
@@ -254,11 +259,14 @@ def _add_signal_markers(
             go.Scatter(
                 x=[s.datetime for s in sells],
                 y=[_y(s, "high") for s in sells],
-                mode="markers",
+                mode="markers+text",
                 name="Sell",
+                text=[s.trade_label for s in sells],
+                textposition="top center",
+                textfont=dict(size=11, color="#dc2626"),
                 marker=dict(symbol="triangle-down", size=16, color="#dc2626", line=dict(width=1.5, color="#fff")),
-                customdata=[[s.confluence, s.reason] for s in sells],
-                hovertemplate="<b>Sell</b> $%{y:.2f}<br>Score %{customdata[0]}/5<br>%{customdata[1]}<extra></extra>",
+                customdata=[[s.trade_label, s.confluence, s.reason] for s in sells],
+                hovertemplate="<b>%{customdata[0]} Sell</b> $%{y:.2f}<br>Score %{customdata[1]}/5<br>%{customdata[2]}<extra></extra>",
             ),
             row=1,
             col=1,

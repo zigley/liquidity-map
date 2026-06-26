@@ -55,10 +55,22 @@ class LiquiditySignal:
     reason: str
     confluence: int
     tags: tuple[str, ...] = ()
+    trade_label: str = ""
 
     @property
     def strength(self) -> int:
         return self.confluence
+
+
+@dataclass(frozen=True)
+class TradePair:
+    pair_id: int
+    buy: LiquiditySignal
+    sell: LiquiditySignal | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.sell is None
 
 
 @dataclass(frozen=True)
@@ -338,3 +350,86 @@ def detect_liquidity_signals(
                 last_sell_idx = i
 
     return signals
+
+
+def filter_alternating_signals(
+    signals: list[LiquiditySignal],
+    *,
+    start_with: Side = "buy",
+) -> list[LiquiditySignal]:
+    """Keep only buy/sell/buy/sell — skip consecutive same-side signals."""
+    ordered = sorted(signals, key=lambda s: pd.Timestamp(s.datetime))
+    need: Side | None = start_with
+    kept: list[LiquiditySignal] = []
+
+    for signal in ordered:
+        if signal.side != need:
+            continue
+        kept.append(signal)
+        need = "sell" if need == "buy" else "buy"
+
+    return _label_trade_sequence(kept)
+
+
+def _label_trade_sequence(signals: list[LiquiditySignal]) -> list[LiquiditySignal]:
+    buy_n = 0
+    sell_n = 0
+    labeled: list[LiquiditySignal] = []
+    for signal in signals:
+        if signal.side == "buy":
+            buy_n += 1
+            label = f"B{buy_n}"
+        else:
+            sell_n += 1
+            label = f"S{sell_n}"
+        labeled.append(
+            LiquiditySignal(
+                datetime=signal.datetime,
+                price=signal.price,
+                side=signal.side,
+                reason=signal.reason,
+                confluence=signal.confluence,
+                tags=signal.tags,
+                trade_label=label,
+            )
+        )
+    return labeled
+
+
+def next_trade_side(*, in_position: bool) -> Side:
+    """Long-only: flat → wait for buy, holding → wait for sell."""
+    return "sell" if in_position else "buy"
+
+
+def build_trade_pairs(signals: list[LiquiditySignal]) -> list[TradePair]:
+    """Group alternating signals into buy → sell round trips."""
+    pairs: list[TradePair] = []
+    current: TradePair | None = None
+    pair_id = 0
+
+    for signal in signals:
+        if signal.side == "buy":
+            if current and current.is_open:
+                pairs.append(current)
+            pair_id += 1
+            current = TradePair(pair_id=pair_id, buy=signal)
+        elif current and current.is_open:
+            current = TradePair(pair_id=current.pair_id, buy=current.buy, sell=signal)
+            pairs.append(current)
+            current = None
+
+    if current:
+        pairs.append(current)
+    return pairs
+
+
+def pair_return_pct(pair: TradePair, df: pd.DataFrame) -> float | None:
+    """Round-trip return % for a completed buy → sell pair."""
+    if pair.is_open:
+        return None
+    bars = {pd.Timestamp(r.datetime): float(r.close) for r in df.itertuples(index=False)}
+    buy_px = bars.get(pd.Timestamp(pair.buy.datetime))
+    sell_px = bars.get(pd.Timestamp(pair.sell.datetime))  # type: ignore[union-attr]
+    if not buy_px or not sell_px or buy_px <= 0:
+        return None
+    return (sell_px - buy_px) / buy_px * 100.0

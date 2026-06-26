@@ -19,9 +19,12 @@ from liquidity_map.paper_broker import get_position_info
 from liquidity_map.profile import build_volume_profile
 from liquidity_map.signals import (
     DEFAULT_SIGNAL_CONFIG,
-    LEGACY_SIGNAL_CONFIG,
     SignalConfig,
+    build_trade_pairs,
     detect_liquidity_signals,
+    filter_alternating_signals,
+    next_trade_side,
+    pair_return_pct,
 )
 
 PERIOD_OPTIONS = {
@@ -174,24 +177,36 @@ def render_chart_tab(
 ) -> None:
     profile = build_volume_profile(df, n_bins=80)
     last_price = float(df["close"].iloc[-1])
-    all_signals = detect_liquidity_signals(df, profile, config=signal_config) if show_signals else []
+    raw_signals = detect_liquidity_signals(df, profile, config=signal_config) if show_signals else []
+    trade_signals = filter_alternating_signals(raw_signals, start_with="buy") if show_signals else []
+    pairs = build_trade_pairs(trade_signals) if trade_signals else []
 
     trade_state = load_trade_state()
     portfolio = get_paper_portfolio(trade_state, symbol=ticker)
     position = get_position_info(portfolio, ticker, last_price)
+    in_position = position is not None and position.qty > 0
+    needed = next_trade_side(in_position=in_position)
 
-    c1, c2, c3 = st.columns(3)
+    c1, c2, c3, c4 = st.columns(4)
     c1.metric("Last price", f"${last_price:.2f}")
-    c2.metric("POC", f"${profile.poc_price:.2f}", help="Price with the most traded volume")
-    if position:
-        c3.metric("Your position", f"{position.qty:.2f} shares", delta=f"${position.pnl:+.0f}")
-    elif show_signals:
-        c3.metric(
-            "Signals",
-            f"{sum(1 for s in all_signals if s.side == 'buy')} buy · {sum(1 for s in all_signals if s.side == 'sell')} sell",
-        )
+    c2.metric("POC", f"${profile.poc_price:.2f}")
+    c3.metric("Status", "HOLDING" if in_position else "FLAT")
+    if show_signals:
+        c4.metric("Next action", f"Wait for {needed.upper()}")
+    elif position:
+        c4.metric("Position", f"{position.qty:.2f} sh", delta=f"${position.pnl:+.0f}")
     else:
-        c3.metric("Value area", f"${profile.val_price:.0f} – ${profile.vah_price:.0f}")
+        c4.metric("Value area", f"${profile.val_price:.0f} – ${profile.vah_price:.0f}")
+
+    if show_signals:
+        last_sig = trade_signals[-1] if trade_signals else None
+        if in_position:
+            plan = f"**Holding** — sell at next **S** marker (resistance / POC reject)."
+        elif last_sig and last_sig.side == "sell":
+            plan = f"**Flat** — last was {last_sig.trade_label} · watch for **B** buy at support."
+        else:
+            plan = f"**Flat** — watch for **B1** buy at VAL / POC support."
+        st.success(plan)
 
     price_lines: tuple[PriceLine, ...] = ()
     if show_price_line and price_line_value > 0:
@@ -216,23 +231,49 @@ def render_chart_tab(
     )
     st.plotly_chart(fig, width="stretch")
 
+    if show_signals and pairs:
+        completed = [p for p in pairs if not p.is_open]
+        open_pair = next((p for p in reversed(pairs) if p.is_open), None)
+        rows = []
+        for p in completed[-8:]:
+            ret = pair_return_pct(p, df)
+            rows.append(
+                {
+                    "Trade": f"#{p.pair_id}",
+                    "Buy": p.buy.trade_label,
+                    "Sell": p.sell.trade_label if p.sell else "—",
+                    "Return": f"{ret:+.2f}%" if ret is not None else "—",
+                }
+            )
+        if open_pair:
+            rows.append(
+                {
+                    "Trade": f"#{open_pair.pair_id}",
+                    "Buy": open_pair.buy.trade_label,
+                    "Sell": "OPEN",
+                    "Return": "—",
+                }
+            )
+        with st.expander(f"Trade pairs ({len(pairs)}) — buy then sell", expanded=simple_view):
+            st.dataframe(rows, width="stretch", hide_index=True)
+
     if simple_view:
         st.info(
-            "**Filtered signals** need confluence score ≥ 3 (trend, wick, edge, volume spike, HVN). "
-            "Gray bars = volume profile · Orange = POC · Hover markers for score breakdown."
+            "Signals alternate **B1 → S1 → B2 → S2**. "
+            "Buy at support, sell at resistance, repeat. "
+            "Gray bars = volume profile · Orange = POC."
         )
-    elif show_signals and all_signals:
-        with st.expander(f"Signal list ({len(all_signals)})"):
+    elif show_signals and trade_signals:
+        with st.expander(f"Signal sequence ({len(trade_signals)})"):
             st.dataframe(
                 [
                     {
+                        "Label": s.trade_label,
                         "Side": s.side.upper(),
-                        "Price": f"${s.price:.2f}",
                         "Score": f"{s.confluence}/5",
-                        "Tags": ", ".join(s.tags),
                         "Reason": s.reason,
                     }
-                    for s in all_signals[-15:]
+                    for s in trade_signals[-12:]
                 ],
                 width="stretch",
                 hide_index=True,
@@ -257,10 +298,10 @@ def _render_backtest_results(result: BacktestResult, label: str | None = None) -
 
     primary_h, primary = _primary_stats(result)
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Trades", n)
-    m2.metric(f"Win rate @ {primary_h} bars", f"{primary.win_rate:.1f}%")
-    m3.metric(f"Avg return @ {primary_h} bars", f"{primary.avg_return_pct:+.2f}%")
-    m4.metric(f"Median @ {primary_h} bars", f"{primary.median_return_pct:+.2f}%")
+    m1.metric("Steps (B/S)", n)
+    m2.metric(f"Win @ {primary_h} bars", f"{primary.win_rate:.1f}%")
+    m3.metric("Round-trip win %", f"{result.round_trip_win_rate:.1f}%")
+    m4.metric("Avg round-trip", f"{result.avg_round_trip_pct:+.2f}%", help=f"{result.completed_pairs} buy→sell pairs")
 
     table = pd.DataFrame(
         [
@@ -341,11 +382,11 @@ def render_backtest_tab(df: pd.DataFrame, ticker: str, signal_config: SignalConf
                 log_rows = []
                 for o in result.outcomes:
                     row = {
+                        "Label": o.trade_label,
                         "Date": pd.Timestamp(o.datetime).strftime("%Y-%m-%d %H:%M"),
                         "Side": o.side.upper(),
                         "Entry": f"${o.entry_price:.2f}",
                         "Score": o.confluence,
-                        "Reason": o.reason,
                     }
                     for h in result.horizons:
                         if h in o.returns:
@@ -382,7 +423,7 @@ def main() -> None:
             show_price_line = False
             price_line_value = 0.0
             auto_trade = False
-            st.caption("Score ≥ 3 from trend, wick, edge, volume, HVN · VAL/VAH/POC only")
+            st.caption("Alternating B→S trades · score ≥ 3 · VAL/VAH/POC")
         else:
             require_trend = st.checkbox("Require trend (50 MA)", value=True)
             require_wick = st.checkbox("Require rejection wick", value=True)

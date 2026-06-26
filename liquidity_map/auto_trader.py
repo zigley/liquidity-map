@@ -28,6 +28,7 @@ from liquidity_map.signals import (
     LiquiditySignal,
     SignalConfig,
     detect_liquidity_signals,
+    next_trade_side,
 )
 
 ET = ZoneInfo("America/New_York")
@@ -161,6 +162,7 @@ def get_actionable_signal(
     min_confluence: int = 3,
     use_confirmed_bar: bool = True,
     signal_config: SignalConfig | None = None,
+    in_position: bool = False,
 ) -> LiquiditySignal | None:
     if len(df) < 2:
         return None
@@ -181,10 +183,11 @@ def get_actionable_signal(
     if not signals:
         return None
 
+    needed = next_trade_side(in_position=in_position)
     bar_dt = df["datetime"].iloc[-2 if use_confirmed_bar else -1]
     bar_ts = pd.Timestamp(bar_dt)
     for signal in reversed(signals):
-        if pd.Timestamp(signal.datetime) == bar_ts:
+        if pd.Timestamp(signal.datetime) == bar_ts and signal.side == needed:
             return signal
     return None
 
@@ -217,15 +220,27 @@ def evaluate_and_trade(
         return TradeResult(action="skip", symbol=sym, signal=None, message="Market closed (9:30–16:00 ET)", dry_run=cfg.dry_run)
 
     profile = build_volume_profile(df)
+    portfolio = get_paper_portfolio(st, sym)
+    in_position = get_position_qty(portfolio, sym) > 0
+    needed = next_trade_side(in_position=in_position)
+
     signal = get_actionable_signal(
         df,
         profile,
         cfg.min_confluence,
         cfg.use_confirmed_bar,
         cfg.signal_config,
+        in_position=in_position,
     )
     if signal is None:
-        return TradeResult(action="hold", symbol=sym, signal=None, message="No actionable liquidity signal on latest bar", dry_run=cfg.dry_run)
+        status = "holding — waiting for SELL" if in_position else "flat — waiting for BUY"
+        return TradeResult(
+            action="hold",
+            symbol=sym,
+            signal=None,
+            message=f"No {needed.upper()} signal on latest bar ({status})",
+            dry_run=cfg.dry_run,
+        )
 
     key = signal_key(sym, signal)
     if key in st.executed_keys:
@@ -245,17 +260,18 @@ def evaluate_and_trade(
             dry_run=True,
         )
 
-    portfolio = get_paper_portfolio(st)
     sell_proceeds = 0.0
 
     try:
         if signal.side == "buy":
+            if in_position:
+                return TradeResult(action="skip", symbol=sym, signal=signal, message="BUY skipped — already holding", dry_run=cfg.dry_run)
             order_id, msg, portfolio = paper_buy(portfolio, sym, cfg.trade_amount_usd, price)
             action: Action = "buy"
         else:
             sell_qty = get_position_qty(portfolio, sym)
             if sell_qty <= 0:
-                return TradeResult(action="skip", symbol=sym, signal=signal, message="Sell signal but no paper position", dry_run=True)
+                return TradeResult(action="skip", symbol=sym, signal=signal, message="SELL skipped — not holding", dry_run=True)
             order_id, msg, portfolio = paper_sell(portfolio, sym, price)
             action = "sell"
             sell_proceeds = sell_qty * price

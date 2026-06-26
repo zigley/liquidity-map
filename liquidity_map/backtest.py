@@ -12,8 +12,11 @@ from liquidity_map.signals import (
     LEGACY_SIGNAL_CONFIG,
     STRICT_SIGNAL_CONFIG,
     LiquiditySignal,
+    Side,
     SignalConfig,
+    build_trade_pairs,
     detect_liquidity_signals,
+    pair_return_pct,
 )
 
 
@@ -24,6 +27,7 @@ class SignalOutcome:
     reason: str
     confluence: int
     entry_price: float
+    trade_label: str = ""
     returns: dict[int, float] = field(default_factory=dict)
     wins: dict[int, bool] = field(default_factory=dict)
 
@@ -51,6 +55,9 @@ class BacktestResult:
     overall: tuple[HorizonStats, ...]
     buy: tuple[HorizonStats, ...]
     sell: tuple[HorizonStats, ...]
+    round_trip_win_rate: float = 0.0
+    avg_round_trip_pct: float = 0.0
+    completed_pairs: int = 0
 
     @property
     def min_strength(self) -> int:
@@ -136,6 +143,9 @@ def run_backtest(
 
     max_h = max(horizons)
     outcomes: list[SignalOutcome] = []
+    next_side: Side = "buy"
+    buy_n = 0
+    sell_n = 0
 
     for i in range(warmup, len(df) - max_h):
         if use_rolling_profile:
@@ -145,8 +155,15 @@ def run_backtest(
             window = df.iloc[: i + 1].copy()
 
         signal = _signal_at_bar(window, cfg)
-        if signal is None:
+        if signal is None or signal.side != next_side:
             continue
+
+        if signal.side == "buy":
+            buy_n += 1
+            label = f"B{buy_n}"
+        else:
+            sell_n += 1
+            label = f"S{sell_n}"
 
         entry = float(df.iloc[i]["close"])
         returns: dict[int, float] = {}
@@ -165,10 +182,29 @@ def run_backtest(
                 reason=signal.reason,
                 confluence=signal.confluence,
                 entry_price=entry,
+                trade_label=label,
                 returns=returns,
                 wins=wins,
             )
         )
+        next_side = "sell" if next_side == "buy" else "buy"
+
+    alt_signals = [
+        LiquiditySignal(
+            datetime=o.datetime,
+            price=o.entry_price,
+            side=o.side,  # type: ignore[arg-type]
+            reason=o.reason,
+            confluence=o.confluence,
+            trade_label=o.trade_label,
+        )
+        for o in outcomes
+    ]
+    pairs = build_trade_pairs(alt_signals)
+    completed = [p for p in pairs if not p.is_open]
+    trip_returns = [r for p in completed if (r := pair_return_pct(p, df)) is not None]
+    rt_win = sum(1 for r in trip_returns if r > 0) / len(trip_returns) * 100 if trip_returns else 0.0
+    rt_avg = sum(trip_returns) / len(trip_returns) if trip_returns else 0.0
 
     return BacktestResult(
         outcomes=tuple(outcomes),
@@ -179,6 +215,9 @@ def run_backtest(
         overall=_summarize(outcomes, None, horizons),
         buy=_summarize(outcomes, "buy", horizons),
         sell=_summarize(outcomes, "sell", horizons),
+        round_trip_win_rate=rt_win,
+        avg_round_trip_pct=rt_avg,
+        completed_pairs=len(completed),
     )
 
 
