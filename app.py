@@ -25,6 +25,7 @@ from liquidity_map.signals import (
 )
 
 PERIOD_OPTIONS = {
+    "1 Day": "1d",
     "1 Week": "5d",
     "1 Month": "1mo",
     "3 Months": "3mo",
@@ -34,10 +35,30 @@ PERIOD_OPTIONS = {
 
 INTERVAL_OPTIONS = {
     "Auto": None,
-    "Daily": "1d",
-    "1 hour": "1h",
+    "1 min": "1m",
+    "5 min": "5m",
     "15 min": "15m",
+    "1 hour": "1h",
+    "Daily": "1d",
 }
+
+
+def _adapt_config_for_range(config: SignalConfig, period: str, n_bars: int) -> SignalConfig:
+    """Shorter MA and cooldown for intraday (1-day) charts."""
+    if period != "1d":
+        return config
+    ma = min(20, max(8, n_bars // 4))
+    return SignalConfig(
+        require_trend_filter=config.require_trend_filter,
+        require_rejection_wick=config.require_rejection_wick,
+        trend_ma_period=ma,
+        volume_spike_pct=config.volume_spike_pct,
+        min_volume_pct=config.min_volume_pct,
+        min_confluence=config.min_confluence,
+        cooldown_bars=max(2, config.cooldown_bars // 2),
+        edge_only=config.edge_only,
+        wick_ratio=config.wick_ratio,
+    )
 
 
 def _build_signal_config(
@@ -266,7 +287,14 @@ def render_backtest_tab(df: pd.DataFrame, ticker: str, signal_config: SignalConf
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        rolling_window = st.number_input("Profile lookback (bars)", min_value=10, max_value=252, value=60, step=5)
+        default_lookback = min(60, max(15, len(df) // 2))
+        rolling_window = st.number_input(
+            "Profile lookback (bars)",
+            min_value=10,
+            max_value=252,
+            value=default_lookback,
+            step=5,
+        )
     with c2:
         use_rolling = st.checkbox("Rolling profile (recommended)", value=True)
     with c3:
@@ -335,7 +363,7 @@ def main() -> None:
 
     with st.sidebar:
         ticker = st.text_input("Ticker", value="SPY").strip().upper()
-        period = PERIOD_OPTIONS[st.selectbox("Range", list(PERIOD_OPTIONS.keys()), index=2)]
+        period = PERIOD_OPTIONS[st.selectbox("Range", list(PERIOD_OPTIONS.keys()), index=3)]
         interval = INTERVAL_OPTIONS[st.selectbox("Interval", list(INTERVAL_OPTIONS.keys()), index=0)]
         interval = interval or auto_interval(period)
 
@@ -395,6 +423,10 @@ def main() -> None:
     yahoo_symbol = resolve_ticker(ticker)
     if yahoo_symbol != ticker:
         st.caption(f"Using Yahoo symbol **{yahoo_symbol}** for index volume data.")
+
+    signal_config = _adapt_config_for_range(signal_config, period, len(df))
+    if period == "1d":
+        st.caption(f"Intraday session · {len(df)} bars · auto interval **{interval}**")
 
     chart_tab, backtest_tab = st.tabs(["Chart", "Backtest"])
 
