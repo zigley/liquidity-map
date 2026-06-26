@@ -35,8 +35,7 @@ def main() -> None:
             df = fetch_bars(args.ticker, period=args.period, interval=interval)
             result = evaluate_and_trade(args.ticker, df, config=cfg)
             ts = datetime.now(ET).strftime("%H:%M:%S")
-            sig = f" | {result.signal.reason}" if result.signal else ""
-            print(f"[{ts}] {result.action.upper():4} {result.symbol} — {result.message}{sig}")
+            print(f"[{ts}] {result.action.upper():4} {result.symbol} — {result.message}")
         except KeyboardInterrupt:
             print("\nStopped.")
             break
