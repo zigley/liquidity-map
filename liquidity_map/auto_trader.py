@@ -22,6 +22,7 @@ from liquidity_map.paper_broker import (
     paper_sell,
     portfolio_value,
 )
+from liquidity_map.exits import DEFAULT_EXIT_CONFIG, check_bar_exit, compute_exit_levels
 from liquidity_map.profile import VolumeProfile, build_volume_profile
 from liquidity_map.signals import (
     DEFAULT_SIGNAL_CONFIG,
@@ -70,6 +71,7 @@ class TradeState:
     paper_cash: float = 10_000.0
     paper_positions: dict[str, float] = field(default_factory=dict)
     paper_cost_basis: dict[str, float] = field(default_factory=dict)
+    peak_prices: dict[str, float] = field(default_factory=dict)
 
 
 def _env_bool(key: str, default: bool) -> bool:
@@ -111,6 +113,7 @@ def load_trade_state(path: Path = STATE_FILE) -> TradeState:
             paper_cash=float(raw.get("paper_cash", 10_000)),
             paper_positions=dict(raw.get("paper_positions", {})),
             paper_cost_basis=dict(raw.get("paper_cost_basis", {})),
+            peak_prices=dict(raw.get("peak_prices", {})),
         )
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         return TradeState()
@@ -224,6 +227,66 @@ def evaluate_and_trade(
     in_position = get_position_qty(portfolio, sym) > 0
     needed = next_trade_side(in_position=in_position)
 
+    if in_position:
+        entry = float(portfolio.cost_basis.get(sym, price))
+        bar_high = float(df["high"].iloc[-1])
+        peak = max(float(st.peak_prices.get(sym, entry)), bar_high, price)
+        st.peak_prices[sym] = peak
+        levels = compute_exit_levels(entry, peak, profile, DEFAULT_EXIT_CONFIG)
+        exit_hit, exit_reason = check_bar_exit(
+            high=bar_high,
+            close=price,
+            levels=levels,
+            config=DEFAULT_EXIT_CONFIG,
+        )
+        if exit_hit:
+            exit_key = f"{sym}|exit|{date.today().isoformat()}|{exit_reason[:40]}"
+            if exit_key not in st.executed_keys:
+                if cfg.dry_run:
+                    return TradeResult(
+                        action="skip",
+                        symbol=sym,
+                        signal=None,
+                        message=f"Exit signal: would SELL {sym} @ ${price:.2f} — {exit_reason}",
+                        dry_run=True,
+                    )
+                try:
+                    sell_qty = get_position_qty(portfolio, sym)
+                    order_id, msg, portfolio = paper_sell(portfolio, sym, price)
+                    st.paper_cash = portfolio.cash
+                    st.paper_positions = portfolio.positions
+                    st.paper_cost_basis = portfolio.cost_basis
+                    st.peak_prices.pop(sym, None)
+                    st.executed_keys.append(exit_key)
+                    st.daily_trade_count += 1
+                    equity = portfolio_value(portfolio, {sym: price})
+                    st.trade_log.append(
+                        {
+                            "timestamp": datetime.now(ET).isoformat(),
+                            "symbol": sym,
+                            "action": "sell",
+                            "signal_reason": exit_reason,
+                            "signal_confluence": 0,
+                            "order_id": order_id,
+                            "price": price,
+                            "amount_usd": round(sell_qty * price, 2),
+                            "paper_equity": round(equity, 2),
+                            "message": msg,
+                        }
+                    )
+                    st.trade_log = st.trade_log[-100:]
+                    save_trade_state(st, state_path)
+                    return TradeResult(
+                        action="sell",
+                        symbol=sym,
+                        signal=None,
+                        message=f"{exit_reason} | {msg} | equity ${equity:,.2f}",
+                        order_id=order_id,
+                        dry_run=False,
+                    )
+                except Exception as exc:
+                    return TradeResult(action="skip", symbol=sym, signal=None, message=f"Exit failed: {exc}", dry_run=True)
+
     signal = get_actionable_signal(
         df,
         profile,
@@ -267,12 +330,14 @@ def evaluate_and_trade(
             if in_position:
                 return TradeResult(action="skip", symbol=sym, signal=signal, message="BUY skipped — already holding", dry_run=cfg.dry_run)
             order_id, msg, portfolio = paper_buy(portfolio, sym, cfg.trade_amount_usd, price)
+            st.peak_prices[sym] = price
             action: Action = "buy"
         else:
             sell_qty = get_position_qty(portfolio, sym)
             if sell_qty <= 0:
                 return TradeResult(action="skip", symbol=sym, signal=signal, message="SELL skipped — not holding", dry_run=True)
             order_id, msg, portfolio = paper_sell(portfolio, sym, price)
+            st.peak_prices.pop(sym, None)
             action = "sell"
             sell_proceeds = sell_qty * price
     except Exception as exc:

@@ -14,6 +14,7 @@ from liquidity_map.auto_trader import (
 )
 from liquidity_map.backtest import BacktestResult, compare_backtest, run_backtest
 from liquidity_map.chart import ChartOptions, PriceLine, build_chart
+from liquidity_map.exits import DEFAULT_EXIT_CONFIG, current_exit_plan, smart_pair_return_pct
 from liquidity_map.data import auto_interval, fetch_bars, resolve_ticker
 from liquidity_map.paper_broker import get_position_info
 from liquidity_map.profile import build_volume_profile
@@ -198,19 +199,35 @@ def render_chart_tab(
     else:
         c4.metric("Value area", f"${profile.val_price:.0f} – ${profile.vah_price:.0f}")
 
-    if show_signals:
+    exit_levels = None
+    if in_position and position:
+        exit_levels, plan = current_exit_plan(df, position.avg_price, DEFAULT_EXIT_CONFIG)
+        if show_signals:
+            st.success(f"**Holding** — {plan}")
+    elif show_signals:
         last_sig = trade_signals[-1] if trade_signals else None
-        if in_position:
-            plan = f"**Holding** — sell at next **S** marker (resistance / POC reject)."
-        elif last_sig and last_sig.side == "sell":
-            plan = f"**Flat** — last was {last_sig.trade_label} · watch for **B** buy at support."
+        if last_sig and last_sig.side == "sell":
+            st.success(f"**Flat** — last was {last_sig.trade_label} · watch for **B** buy at support.")
         else:
-            plan = f"**Flat** — watch for **B1** buy at VAL / POC support."
-        st.success(plan)
+            st.success("**Flat** — buy at **B** marker (VAL/POC support). Sell via **VAH target** or **trail stop**, not POC.")
 
-    price_lines: tuple[PriceLine, ...] = ()
+    price_lines: list[PriceLine] = []
+    if in_position and position and exit_levels:
+        if exit_levels.take_profit:
+            price_lines.append(
+                PriceLine(exit_levels.take_profit, f"Take profit ${exit_levels.take_profit:.0f}", "#22c55e", "solid")
+            )
+        if exit_levels.trail_stop:
+            price_lines.append(
+                PriceLine(
+                    exit_levels.trail_stop,
+                    f"Trail {DEFAULT_EXIT_CONFIG.trail_pct}%",
+                    "#ef4444",
+                    "dot",
+                )
+            )
     if show_price_line and price_line_value > 0:
-        price_lines = (PriceLine(price=price_line_value, label=f"${price_line_value:.2f}"),)
+        price_lines.append(PriceLine(price=price_line_value, label=f"${price_line_value:.2f}"))
 
     fig = build_chart(
         df,
@@ -224,7 +241,7 @@ def render_chart_tab(
             min_confluence=signal_config.min_confluence,
             signal_config=signal_config,
             show_volume=show_volume,
-            price_lines=price_lines,
+            price_lines=tuple(price_lines),
             position=position,
             show_position_line=position is not None,
         ),
@@ -236,13 +253,16 @@ def render_chart_tab(
         open_pair = next((p for p in reversed(pairs) if p.is_open), None)
         rows = []
         for p in completed[-8:]:
-            ret = pair_return_pct(p, df)
+            sig_ret = pair_return_pct(p, df)
+            smart_ret, smart_reason = smart_pair_return_pct(df, p.buy.datetime, DEFAULT_EXIT_CONFIG)
             rows.append(
                 {
                     "Trade": f"#{p.pair_id}",
                     "Buy": p.buy.trade_label,
-                    "Sell": p.sell.trade_label if p.sell else "—",
-                    "Return": f"{ret:+.2f}%" if ret is not None else "—",
+                    "Signal exit": p.sell.trade_label if p.sell else "—",
+                    "Signal %": f"{sig_ret:+.2f}%" if sig_ret is not None else "—",
+                    "Smart exit %": f"{smart_ret:+.2f}%" if smart_ret is not None else "—",
+                    "Smart rule": smart_reason.split(" at ")[0] if smart_reason else "",
                 }
             )
         if open_pair:
@@ -259,9 +279,8 @@ def render_chart_tab(
 
     if simple_view:
         st.info(
-            "Signals alternate **B1 → S1 → B2 → S2**. "
-            "Buy at support, sell at resistance, repeat. "
-            "Gray bars = volume profile · Orange = POC."
+            "**Buy** at B markers (support). **Sell** at green VAH take-profit or red trail stop — "
+            "not when price drifts back to POC. Trail 1.5% below peak (1% after VAH)."
         )
     elif show_signals and trade_signals:
         with st.expander(f"Signal sequence ({len(trade_signals)})"):
