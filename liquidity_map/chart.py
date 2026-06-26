@@ -67,17 +67,17 @@ def build_chart(
         col=2,
     )
 
-    _hline(fig, profile.poc_price, "POC", "#f59e0b", "solid", 2)
-    _hline(fig, profile.val_price, "VAL", "#94a3b8", "dot")
-    _hline(fig, profile.vah_price, "VAH", "#94a3b8", "dot")
+    _hline(fig, profile.poc_price, "Busiest price", "#f59e0b", "solid", 2)
+    _hline(fig, profile.val_price, "Support floor", "#94a3b8", "dot")
+    _hline(fig, profile.vah_price, "Profit ceiling", "#94a3b8", "dot")
 
     ln = lines or ChartLines()
     if ln.entry:
-        _hline(fig, ln.entry, "Entry", "#38bdf8", "solid", 2)
+        _hline(fig, ln.entry, "You bought here", "#38bdf8", "solid", 2)
     if ln.target:
-        _hline(fig, ln.target, "Target", "#22c55e", "solid", 1.5)
+        _hline(fig, ln.target, "Take profit here", "#22c55e", "solid", 1.5)
     if ln.stop:
-        _hline(fig, ln.stop, "Stop", "#ef4444", "dot", 1.5)
+        _hline(fig, ln.stop, "Sell if drops here", "#ef4444", "dot", 1.5)
 
     bars = {pd.Timestamp(r.datetime): r for r in df.itertuples(index=False)}
     buys = [m for m in markers if m.action == "buy"]

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stock buy/sell signals — one model, one screen."""
+"""Stock buy/sell signals — plain English, one screen."""
 
 from __future__ import annotations
 
@@ -9,7 +9,14 @@ import streamlit as st
 from liquidity_map.auto_trader import evaluate_and_trade, get_paper_portfolio, load_trade_state
 from liquidity_map.chart import ChartLines, build_chart
 from liquidity_map.data import auto_interval, fetch_bars, resolve_ticker
-from liquidity_map.model import DEFAULT_CONFIG, adapt_config, backtest, live_advice, scan_trades
+from liquidity_map.model import (
+    STRICTNESS_LABELS,
+    adapt_config,
+    backtest,
+    config_for_strictness,
+    live_advice,
+    scan_trades,
+)
 from liquidity_map.paper_broker import get_position_info
 
 RANGES = {
@@ -27,48 +34,60 @@ def _load(ticker: str, period: str, interval: str) -> pd.DataFrame:
     return fetch_bars(ticker, period=period, interval=interval)
 
 
-def _action_banner(advice) -> None:
-    colors = {"buy": "green", "sell": "red", "wait": "gray"}
-    icons = {"buy": "🟢 BUY", "sell": "🔴 SELL", "wait": "⚪ WAIT"}
-    st.markdown(
-        f":{colors[advice.action]}[**{icons[advice.action]}** — {advice.reason}]"
-    )
+def _banner(advice) -> None:
+    if advice.action == "buy":
+        st.success(f"**BUY** — {advice.reason}")
+    elif advice.action == "sell":
+        st.error(f"**SELL** — {advice.reason}")
+    else:
+        st.info(f"**WAIT** — {advice.reason}")
 
 
 def main() -> None:
     st.set_page_config(page_title="Stock Signals", layout="wide")
-    st.title("Stock Buy / Sell Signals")
+    st.title("Should I buy or sell?")
 
     with st.sidebar:
-        ticker = st.text_input("Ticker", "SPY").strip().upper()
-        period = RANGES[st.selectbox("Range", list(RANGES.keys()), index=3)]
-        interval = auto_interval(period)
+        ticker = st.text_input("Stock symbol", "SPY").strip().upper()
+        period = RANGES[st.selectbox("How far back to look", list(RANGES.keys()), index=3)]
+
+        st.divider()
+        strictness = st.slider(
+            "How picky should signals be?",
+            min_value=1,
+            max_value=5,
+            value=3,
+            help="Left = more trades. Right = fewer trades, but cleaner setups.",
+        )
+        st.caption(STRICTNESS_LABELS[strictness])
 
         st.divider()
         st.markdown(
             """
-**The model**
-1. **Buy** — uptrend + bounce off VAL or POC
-2. **Sell** — trail stop or VAH target
-3. **Wait** — anything else
+**In plain English**
+- **Buy** when price bounces off a busy support level and trend is up
+- **Sell** at your profit target, or if price drops from its high
+- **Wait** otherwise — no guesswork
             """
         )
 
     if not ticker:
-        st.warning("Enter a ticker.")
+        st.warning("Type a stock symbol above.")
         return
 
     try:
-        df = _load(ticker, period, interval)
+        df = _load(ticker, period, auto_interval(period))
     except Exception as exc:
-        st.error(str(exc))
+        st.error(f"Could not load {ticker}: {exc}")
         return
 
-    if resolve_ticker(ticker) != ticker:
-        st.caption(f"Data via {resolve_ticker(ticker)}")
+    yahoo = resolve_ticker(ticker)
+    if yahoo != ticker:
+        st.caption(f"Loading data as {yahoo}")
 
-    cfg = adapt_config(period, len(df), DEFAULT_CONFIG)
+    cfg = adapt_config(period, len(df), config_for_strictness(strictness))
     markers = scan_trades(df, cfg)
+    stats = backtest(df, cfg)
 
     state = load_trade_state()
     portfolio = get_paper_portfolio(state, ticker)
@@ -85,61 +104,74 @@ def main() -> None:
         cfg=cfg,
     )
 
-    _action_banner(advice)
+    _banner(advice)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Price", f"${advice.price:.2f}")
-    c2.metric("POC", f"${advice.poc:.2f}")
-    c3.metric("VAL → VAH", f"${advice.val:.0f} – ${advice.vah:.0f}")
-    stats = backtest(df, cfg)
-    c4.metric("Backtest win %", f"{stats.win_rate:.0f}%" if stats.trades else "—")
+    c1.metric("Price now", f"${advice.price:.2f}")
+    c2.metric("Busiest price", f"${advice.poc:.2f}", help="Where the most shares traded")
+    c3.metric("Support → Profit", f"${advice.val:.0f} → ${advice.vah:.0f}")
+    if stats.trades:
+        c4.metric(
+            "Past trades won",
+            f"{stats.win_rate:.0f}%",
+            help=f"{stats.trades} buy-then-sell trades in this range",
+        )
+    else:
+        c4.metric("Past trades", "None in range")
 
-    lines = ChartLines(
-        entry=position.avg_price if in_pos else None,
-        target=advice.target,
-        stop=advice.stop,
+    st.plotly_chart(
+        build_chart(
+            df,
+            ticker,
+            markers,
+            advice,
+            ChartLines(
+                entry=position.avg_price if in_pos else None,
+                target=advice.target,
+                stop=advice.stop,
+            ),
+        ),
+        width="stretch",
     )
-    st.plotly_chart(build_chart(df, ticker, markers, advice, lines), width="stretch")
 
-    col_a, col_b = st.columns(2)
+    left, right = st.columns(2)
 
-    with col_a:
-        st.subheader("How to trade this")
+    with left:
+        st.subheader("What the lines mean")
         st.markdown(
             f"""
-| Step | Rule |
-|------|------|
-| **Buy** | Price above MA, bounces off **VAL** or **POC** with rejection wick |
-| **Target** | **VAH** (green line) — take profit |
-| **Stop** | **Trail** (red line) — {cfg.trail_pct}% below peak |
-| **Flat** | Wait for next **B** marker |
+- **Orange — Busiest price:** where most volume traded
+- **Gray — Support floor / Profit ceiling:** cheap zone vs expensive zone
+- **Green — Take profit here:** sell when price reaches this (if you're in)
+- **Red — Sell if drops here:** protects gains ({cfg.trail_pct:.1f}% below the high)
+- **B1, S1…** — past buys and sells this model would have made
             """
         )
 
-    with col_b:
+    with right:
         st.subheader("Past trades")
         if not markers:
-            st.caption("No trades in this range.")
+            st.write("No trades matched your pickiness level in this date range. Try **Loose** (1–2) or a longer range.")
         else:
             closes = {pd.Timestamp(r.datetime): float(r.close) for r in df.itertuples(index=False)}
-            rows = []
             buys = [m for m in markers if m.action == "buy"]
             sells = [m for m in markers if m.action == "sell"]
+            rows = []
             for b, s in zip(buys, sells):
                 bp, sp = closes.get(pd.Timestamp(b.datetime)), closes.get(pd.Timestamp(s.datetime))
-                ret = f"{(sp - bp) / bp * 100:+.2f}%" if bp and sp and bp > 0 else "—"
-                rows.append({"Buy": b.label, "Sell": s.label, "Return": ret, "Exit": s.reason[:40]})
-            if len(buys) > len(sells) and buys:
-                rows.append({"Buy": buys[-1].label, "Sell": "OPEN", "Return": "—", "Exit": "—"})
+                ret = f"{(sp - bp) / bp * 100:+.1f}%" if bp and sp and bp > 0 else "—"
+                rows.append({"Buy": b.label, "Sell": s.label, "Made": ret})
+            if len(buys) > len(sells):
+                rows.append({"Buy": buys[-1].label, "Sell": "still open", "Made": "—"})
             st.dataframe(rows, width="stretch", hide_index=True)
-            if stats.trades:
-                st.caption(
-                    f"{stats.trades} round trips · avg {stats.avg_return_pct:+.2f}% · "
-                    f"total {stats.total_return_pct:+.2f}%"
-                )
+            st.caption(
+                f"At this pickiness: {stats.trades} completed trades, "
+                f"average {stats.avg_return_pct:+.1f}% each"
+            )
 
-    with st.expander("Paper trade check"):
-        if st.button("Run check now"):
+    with st.expander("Test a paper trade"):
+        st.caption("Runs the same BUY / SELL / WAIT rules against your fake portfolio.")
+        if st.button("Check now"):
             r = evaluate_and_trade(ticker, df)
             st.write(f"**{r.action.upper()}** — {r.message}")
 

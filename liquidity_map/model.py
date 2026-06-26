@@ -37,6 +37,14 @@ class ModelConfig:
 
 DEFAULT_CONFIG = ModelConfig()
 
+STRICTNESS_LABELS: dict[int, str] = {
+    1: "Loose — more buy signals, less picky",
+    2: "Relaxed — a few extra trades",
+    3: "Balanced — default",
+    4: "Careful — only cleaner setups",
+    5: "Strict — fewest trades, highest bar",
+}
+
 
 @dataclass(frozen=True)
 class TradeMarker:
@@ -113,9 +121,13 @@ def _entry_trigger(
     rng = h - l
     wick_ok = rng <= 0 or (min(o, c) - l) / rng >= cfg.wick_ratio or c > o
 
-    for name, level in (("VAL", profile.val_price), ("POC", profile.poc_price)):
+    spots = (
+        ("the support floor", profile.val_price),
+        ("the busiest price", profile.poc_price),
+    )
+    for label, level in spots:
         if _touches_support(l, c, level, tol) and c >= level * 0.999 and bullish and wick_ok:
-            return True, f"Bounce off {name} ${level:.2f} (uptrend)"
+            return True, f"Price bounced off {label} (${level:.2f}). Trend is up — good time to buy."
 
     return False, ""
 
@@ -141,9 +153,9 @@ def _exit_trigger(
 ) -> tuple[bool, str]:
     target, stop = _exit_levels(entry, peak, profile, cfg)
     if target is not None and h >= target:
-        return True, f"Target VAH ${target:.2f}"
+        return True, f"Hit the profit target (${target:.2f}) — time to sell."
     if stop is not None and c <= stop:
-        return True, f"Trail stop ${stop:.2f} ({cfg.trail_pct}% below peak ${peak:.2f})"
+        return True, f"Price fell {cfg.trail_pct:.1f}% from its high — sell to protect gains."
     return False, ""
 
 
@@ -257,9 +269,14 @@ def live_advice(
                 val=profile.val_price,
                 vah=profile.vah_price,
             )
-        wait = f"Holding — target ${target:.2f}" if target else "Holding"
-        if stop:
-            wait += f", stop ${stop:.2f}"
+        if target and stop:
+            wait = f"You own this. Sell near ${target:.2f} (profit target), or if price drops to ${stop:.2f}."
+        elif target:
+            wait = f"You own this. Sell near ${target:.2f} when price gets there."
+        elif stop:
+            wait = f"You own this. Sell if price drops to ${stop:.2f}."
+        else:
+            wait = "You own this. Waiting for a sell signal."
         return TradeAdvice(
             action="wait",
             reason=wait,
@@ -288,7 +305,7 @@ def live_advice(
     if not _trend_up(c, ma):
         return TradeAdvice(
             action="wait",
-            reason=f"Below {ma_len}-bar MA — wait for uptrend",
+            reason="Trend is down — sit on your hands for now.",
             price=price,
             poc=profile.poc_price,
             val=profile.val_price,
@@ -297,7 +314,10 @@ def live_advice(
 
     return TradeAdvice(
         action="wait",
-        reason=f"Watch VAL ${profile.val_price:.2f} or POC ${profile.poc_price:.2f} for bounce",
+        reason=(
+            f"No buy yet. Watch the support floor (${profile.val_price:.2f}) "
+            f"or busiest price (${profile.poc_price:.2f}) for a bounce."
+        ),
         price=price,
         poc=profile.poc_price,
         val=profile.val_price,
@@ -334,6 +354,40 @@ def backtest(df: pd.DataFrame, cfg: ModelConfig = DEFAULT_CONFIG) -> BacktestSta
     )
 
 
+def config_for_strictness(level: int) -> ModelConfig:
+    """1 = loose (more trades), 5 = strict (fewer, pickier)."""
+    level = max(1, min(5, level))
+    loose = dict(
+        volume_mult=0.65,
+        wick_ratio=0.20,
+        level_tolerance=2.8,
+        min_gain_for_trail=0.3,
+        trail_pct=2.0,
+        cooldown_bars=2,
+        min_vah_gain_pct=0.5,
+    )
+    strict = dict(
+        volume_mult=1.15,
+        wick_ratio=0.42,
+        level_tolerance=1.3,
+        min_gain_for_trail=0.8,
+        trail_pct=1.2,
+        cooldown_bars=5,
+        min_vah_gain_pct=1.2,
+    )
+    t = (level - 1) / 4
+    pick = lambda k: loose[k] + t * (strict[k] - loose[k])  # noqa: E731
+    return ModelConfig(
+        volume_mult=pick("volume_mult"),
+        wick_ratio=pick("wick_ratio"),
+        level_tolerance=pick("level_tolerance"),
+        min_gain_for_trail=pick("min_gain_for_trail"),
+        trail_pct=pick("trail_pct"),
+        cooldown_bars=round(pick("cooldown_bars")),
+        min_vah_gain_pct=pick("min_vah_gain_pct"),
+    )
+
+
 def adapt_config(period: str, n_bars: int, cfg: ModelConfig = DEFAULT_CONFIG) -> ModelConfig:
     if period != "1d":
         return cfg
@@ -346,5 +400,6 @@ def adapt_config(period: str, n_bars: int, cfg: ModelConfig = DEFAULT_CONFIG) ->
         min_vah_gain_pct=cfg.min_vah_gain_pct,
         wick_ratio=cfg.wick_ratio,
         volume_mult=cfg.volume_mult,
+        level_tolerance=cfg.level_tolerance,
         cooldown_bars=max(2, cfg.cooldown_bars // 2),
     )
